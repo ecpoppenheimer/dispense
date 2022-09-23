@@ -4,8 +4,7 @@ import pathlib
 
 import PyQt5.QtWidgets as qtw
 
-from tfrt2.settings import Settings
-
+from epyqtsettings.settings import Settings
 from dispense.dispenser_tcp_controller import Dispenser
 
 

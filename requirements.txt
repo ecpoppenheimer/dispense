@@ -1,2 +1,4 @@
 ericspyqtparts
 PyQt5
+twisted
+numpy

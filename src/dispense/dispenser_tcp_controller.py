@@ -7,8 +7,8 @@ import PyQt5.QtNetwork as qtn
 import PyQt5.QtCore as qtc
 import numpy as np
 
-from tfrt2.tcp_base import IP4Validator
-import tfrt2.component_widgets as cw
+from epyqtwidgets.ip4validator import IP4Validator
+import epyqtsettings.settings_widgets as sw
 
 
 class Dispenser:
@@ -190,12 +190,12 @@ class Dispenser:
         ui_row = 0
 
         # IP controls
-        self._ui.ip_entry = cw.SettingsEntryBox(self.settings, "server_ip", str, validator=IP4Validator())
+        self._ui.ip_entry = sw.SettingsEntryBox(self.settings, "server_ip", str, validator=IP4Validator())
         self._ui.ip_entry.edit_box.textChanged.connect(self._ip_changed)
         layout.addWidget(self._ui.ip_entry, ui_row, 0, 1, 12)
         ui_row += 1
 
-        self._ui.port_entry = cw.SettingsEntryBox(
+        self._ui.port_entry = sw.SettingsEntryBox(
             self.settings, "server_port", int, validator=qtg.QIntValidator(0, 65535)
         )
         layout.addWidget(self._ui.port_entry, ui_row, 0, 1, 12)
@@ -255,16 +255,14 @@ class Dispenser:
             self.polling_period = self.settings.polling_period
 
         def set_polling_active():
-            print(f"did set polling active.")
             self.polling_active = self.settings.polling_active
-            print(f"polling active is now {self.polling_active}")
 
-        self._ui.polling_active_entry = cw.SettingsCheckBox(
+        self._ui.polling_active_entry = sw.SettingsCheckBox(
             self.settings, "polling_active", "Activate Read Polling", callback=set_polling_active
         )
         reg_layout.addWidget(self._ui.polling_active_entry, reg_ui_row, 0, 1, 6)
 
-        self._ui.polling_period_entry = cw.SettingsEntryBox(
+        self._ui.polling_period_entry = sw.SettingsEntryBox(
             self.settings, "polling_period", float, qtg.QDoubleValidator(.001, 1000, 3), set_polling_period
         )
         reg_layout.addWidget(self._ui.polling_period_entry, reg_ui_row, 6, 1, 6)
