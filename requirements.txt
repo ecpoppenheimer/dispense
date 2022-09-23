@@ -1,0 +1,2 @@
+ericspyqtparts
+PyQt5
