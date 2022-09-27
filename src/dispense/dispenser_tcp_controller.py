@@ -134,6 +134,7 @@ class Dispenser:
         self.settings.establish_defaults(
             server_port=self.DEFAULT_PORT, server_ip="localhost", polling_active=True, polling_period=1.0
         )
+        self.connection_event = ConnectionChanged()
 
         self._server_socket = None
         self._ui = types.SimpleNamespace()
@@ -315,6 +316,7 @@ class Dispenser:
             self._ui.read_button.setEnabled(True)
             self.registers["digitals"].set_enabled(True)
             self.read(callback=self._initial_read_completed)
+            self.connection_event.emit(True)
 
     def _initial_read_completed(self, _):
         self._connection_ready = True
@@ -341,6 +343,7 @@ class Dispenser:
         self.registers["digitals"].set_enabled(False)
         self._connection_ready = False
         self._try_toggle_polling()
+        self.connection_event.emit(False)
 
     def shut_down(self):
         self.disconnect()
@@ -1169,6 +1172,16 @@ class FlagHigh(qtc.QObject):
 
 
 class FlagChanged(qtc.QObject):
+    sig = qtc.pyqtSignal(bool)
+
+    def connect(self, value):
+        self.sig.connect(value)
+
+    def emit(self, *args):
+        self.sig.emit(*args)
+
+
+class ConnectionChanged(qtc.QObject):
     sig = qtc.pyqtSignal(bool)
 
     def connect(self, value):
