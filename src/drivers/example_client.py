@@ -24,7 +24,7 @@ class ClientWindow(qtw.QWidget):
         layout = qtw.QVBoxLayout()
         self.setLayout(layout)
         self.dispenser = Dispenser(self.settings)
-        layout.addWidget(self.dispenser.make_ui_widget())
+        layout.addWidget(self.dispenser.ui_widget)
 
         """def a():
             print("    * just went high")

@@ -49,7 +49,7 @@ class Dispenser:
     malformed message, so with good design they shouldn't even happen, but I am going to try to account for them anyway.
     """
     _initialized = False
-    DEFAULT_PORT = 8088
+    DEFAULT_PORT = 9000
 
     # Commands to send to the dispenser.
     READ = 3
@@ -128,11 +128,15 @@ class Dispenser:
         dtype=np.int32
     )
 
-    def __init__(self, settings):
+    def __init__(self, settings, ip=None, port=None):
         self.settings = settings
         self._data = b""
+        if ip is None:
+            ip = "localhost"
+        if port is None:
+            port = self.DEFAULT_PORT
         self.settings.establish_defaults(
-            server_port=self.DEFAULT_PORT, server_ip="localhost", polling_active=True, polling_period=1.0
+            dispenser_port=port, dispenser_ip=ip, polling_active=True, polling_period=1.0
         )
         self.connection_event = ConnectionChanged()
 
@@ -184,20 +188,26 @@ class Dispenser:
         self._message_queue = queue.Queue()
         self._initialized = True
 
-    def make_ui_widget(self):
+        self._make_ui_widget()
+
+    @property
+    def ui_widget(self):
+        return self._ui.base_widget
+
+    def _make_ui_widget(self):
         self._ui.base_widget = qtw.QWidget()
         layout = qtw.QGridLayout()
         self._ui.base_widget.setLayout(layout)
         ui_row = 0
 
         # IP controls
-        self._ui.ip_entry = sw.SettingsEntryBox(self.settings, "server_ip", str, validator=IP4Validator())
+        self._ui.ip_entry = sw.SettingsEntryBox(self.settings, "dispenser_ip", str, validator=IP4Validator())
         self._ui.ip_entry.edit_box.textChanged.connect(self._ip_changed)
         layout.addWidget(self._ui.ip_entry, ui_row, 0, 1, 12)
         ui_row += 1
 
         self._ui.port_entry = sw.SettingsEntryBox(
-            self.settings, "server_port", int, validator=qtg.QIntValidator(0, 65535)
+            self.settings, "dispenser_port", int, validator=qtg.QIntValidator(0, 65535)
         )
         layout.addWidget(self._ui.port_entry, ui_row, 0, 1, 12)
         ui_row += 1
@@ -295,14 +305,18 @@ class Dispenser:
 
         return self._ui.base_widget
 
-    def connect(self, address, port):
+    def connect(self, address=None, port=None):
+        if address is None:
+            address = self.settings.dispenser_ip
+        if port is None:
+            port = self.settings.dispenser_port
         self._server_socket = qtn.QTcpSocket(self._ui.base_widget)
         self._server_socket.connectToHost(address, port)
         self._server_socket.connected.connect(self._got_connection)
 
     def _click_connect(self):
         if self._server_socket is None:
-            self.connect(self.settings.server_ip, self.settings.server_port)
+            self.connect()
             self._ui.connect_button.setText("Working...")
         else:
             self.disconnect()
