@@ -123,11 +123,6 @@ class Dispenser:
     ]
     WRITE_INDICES = np.arange(WRITE_REG_COUNT)
 
-    BLANK_WRITE_DATA = np.array(
-        [0, 1, 1, 1, 1, 3, 0, 0, 0, 0, 1, 19011213, 0, 0, 0, 0, 0, 0, 0, 0],
-        dtype=np.int32
-    )
-
     def __init__(self, settings, ip=None, port=None):
         self.settings = settings
         self._data = b""
@@ -160,23 +155,50 @@ class Dispenser:
             "shot_count": Register(self, "shot_count", 0, 2147483647, int, 8),
             "software_version": Register(self, "software_version", 0, 2147483647, int, 13, scale=1000),
             "time_format": TimeFormatRegister(self, "time_format", 0, 2, int, 16),
-            "program_num": Register(self, "program_num", 1, 16, int, 2, write_index=1),
+            "program_num": Register(
+                self, "program_num", 1, 16, int, 2, write_index=1,
+                digital_update_register=DigitalRegister._write_bits["update_program_num"]
+            ),
             "system_date": DateRegister(self, "system_date", 19011213, 20380119, int, 11, write_index=10),
             "system_time": TimeRegister(self, "system_time", 0, 235959, int, 12, write_index=11),
-            "dispense_mode": SelectableRegister(self, "dispense_mode", {
-                1: "single_shot", 2: "steady_mode", 3: "teach_mode", 4: "multishot"
-            }, 3, 2),
-            "dispense_time": Register(self, "dispense_time", .0001, 9999, float, 4, 3, scale=10000, unit_type="s"),
-            "pressure_units": SelectableRegister(self, "pressure_units", {
-                0: "psi", 1: "bar", 2: "kpa"
-            }, 14, 4, selection_callback=self._update_pressure_units),
-            "pressure": Register(self, "pressure", .68, 689.4, float, 5, 5, scale=100, unit_type=14),
-            "vacuum_units": SelectableRegister(self, "vacuum_units", {
-                0: "inches_water", 1: "inches_Hg", 2: "kpa"
-            }, 15, 6, selection_callback=self._update_vacuum_units),
-            "vacuum": Register(self, "vacuum", 0, 18.0, float, 6, 7, scale=100, unit_type=15),
-            "multishot_count": Register(self, "multishot_count", 0, 9999, int, 9, 8),
-            "multishot_time": Register(self, "multishot_time", .1, 999.9, float, 10, 9, scale=100, unit_type="s"),
+            "dispense_mode": SelectableRegister(
+                self, "dispense_mode", {
+                    1: "single_shot", 2: "steady_mode", 3: "teach_mode", 4: "multishot"
+                }, 3, 2,
+                digital_update_register=DigitalRegister._write_bits["update_program_params"]
+            ),
+            "dispense_time": Register(
+                self, "dispense_time", .0001, 9999, float, 4, 3, scale=10000, unit_type="s",
+                digital_update_register=DigitalRegister._write_bits["update_program_params"]
+            ),
+            "pressure_units": SelectableRegister(
+                self, "pressure_units", {
+                    0: "psi", 1: "bar", 2: "kpa"
+                }, 14, 4, selection_callback=self._update_pressure_units,
+                digital_update_register=DigitalRegister._write_bits["update_units"]
+            ),
+            "pressure": Register(
+                self, "pressure", .68, 689.4, float, 5, 5, scale=100, unit_type=14,
+                digital_update_register=DigitalRegister._write_bits["update_program_params"]
+            ),
+            "vacuum_units": SelectableRegister(
+                self, "vacuum_units", {
+                    0: "inches_water", 1: "inches_Hg", 2: "kpa"
+                }, 15, 6, selection_callback=self._update_vacuum_units,
+                digital_update_register=DigitalRegister._write_bits["update_units"]
+            ),
+            "vacuum": Register(
+                self, "vacuum", 0, 18.0, float, 6, 7, scale=100, unit_type=15,
+                digital_update_register=DigitalRegister._write_bits["update_program_params"]
+            ),
+            "multishot_count": Register(
+                self, "multishot_count", 0, 9999, int, 9, 8,
+                digital_update_register=DigitalRegister._write_bits["update_program_params"]
+            ),
+            "multishot_time": Register(
+                self, "multishot_time", .1, 999.9, float, 10, 9, scale=100, unit_type="s",
+                digital_update_register=DigitalRegister._write_bits["update_program_params"]
+            ),
         })
         self._write_registers_by_index = [self.registers[name] for name in self.WRITE_REGISTERS]
         self._read_registers_by_index = [self.registers[name] for name in self.READ_REGISTERS]
@@ -374,6 +396,7 @@ class Dispenser:
         delimiter_pos = self._data.find(b';')
         while delimiter_pos > 0:
             chunk = self._data[:delimiter_pos]
+            print(f"[SERVER] {str(chunk)}")
             chunk_data = np.asarray(chunk.split(b','))
             chunk_data =tuple(int(b.decode("utf-8")) for b in chunk_data)
             self._data = self._data[delimiter_pos + 1:]
@@ -381,7 +404,7 @@ class Dispenser:
 
             # Match this chunk to the message queue, to make sure that the message was correctly acknowledged, or
             # forward the error if an error was received.
-            original_message, callback, error_callback, digital = self._message_queue.get()
+            original_message, callback, error_callback, digital, update_registers = self._message_queue.get()
 
             if np.all(chunk_data[:3] == original_message[:3]):
                 # command was successful
@@ -395,6 +418,17 @@ class Dispenser:
                             callback(labeled_data)
                 else:  # Should only ever reach here if header[0] == self.WRITE
                     self._notify_registers(original_message, True)
+                    if update_registers == 0x8000:
+                        # This is a sentinel value, no digital register has this mask.  This write command was an
+                        # update_registers command, so now need to clear ALL of the update registers.
+                        self._close_update_signals()
+                    elif update_registers != 0x0000:
+                        # Some registers need to pulse one of the digital registers for the update to take effect.
+                        self._message_queue.put(((self.WRITE, 0, 1), None, None, None, 0x8000))
+                        d_val = self._write_registers_by_index[0]._write_value | update_registers
+                        message = f"{self.WRITE},0,1,{d_val};".encode("utf-8")
+                        self._server_socket.write(message)
+                        print(f"[CLIENT] {message}")
                     if callback is not None:
                         if digital is not None:
                             callback(digital, self.registers["digitals"].check_write_value(digital))
@@ -411,18 +445,16 @@ class Dispenser:
                 original_command = original_message[0]
                 if original_command == self.WRITE and error_command == self.WRITE_ERROR:
                     self._notify_registers(original_message, False, self.ERROR_CODES[error_code])
-                    if error_callback is not None:
-                        error_callback(self.ERROR_CODES[error_code], original_message)
                     print(f"Dispenser: write error successfully caught.")
                 elif original_command == self.READ and error_command == self.READ_ERROR:
-                    if error_callback is not None:
-                        error_callback(self.ERROR_CODES[error_code], original_message)
                     print(f"Dispenser: read error successfully caught.")
                 else:
-                    raise RuntimeError(
-                        f"Dispenser: caught wrong kind of error for command!  Error code is "
+                    print(
+                        f"Dispenser: Unknown or inappropriate error code.  Error code is "
                         f"{error_code}, and original data is {original_message}"
                     )
+                if error_callback is not None:
+                    error_callback(self.ERROR_CODES[error_code], original_message)
 
     def _read_all(self):
         # Stub to consume the arg that the read_button.clicked event seems to be feeding to this function
@@ -438,7 +470,8 @@ class Dispenser:
             raise ValueError(f"Dispenser.read: count of {count} too high for start register {start_register}.")
 
         data = f"{self.READ},{start_register},{count};".encode("utf-8")
-        self._message_queue.put(((self.READ, start_register, count), callback, error_callback, digital))
+        self._message_queue.put(((self.READ, start_register, count), callback, error_callback, digital, None))
+        print(f"[CLIENT] {data}")
         self._server_socket.write(data)
 
     def write(self, start_register=0, count=None, callback=None, error_callback=None, digital=None):
@@ -450,11 +483,16 @@ class Dispenser:
         elif count > self.READ_REG_COUNT - start_register:
             raise ValueError(f"Dispenser.read: count of {count} too high for start register {start_register}.")
 
+        update_registers = 0x0000
         data = f"{self.WRITE},{start_register},{count}".encode("utf-8")
         for i in range(start_register, start_register + count):
             data += b"," + self._write_registers_by_index[i].to_bytes()
+            update_registers |= self._write_registers_by_index[i].digital_update_register
         data += b";"
-        self._message_queue.put(((self.WRITE, start_register, count), callback, error_callback, digital))
+        self._message_queue.put((
+            (self.WRITE, start_register, count), callback, error_callback, digital, update_registers
+        ))
+        print(f"[CLIENT] {data}")
         self._server_socket.write(data)
 
     def do_deferred_writes(self, *_, callback=None, error_callback=None, digital=None):
@@ -714,137 +752,37 @@ class Dispenser:
         else:
             self._polling_timer.stop()
 
+    def _close_update_signals(self):
+        d = self.registers["digitals"]
+        d._write_value &= 0x081f
+        d._write_buttons["update_program_params"].setStyleSheet("QPushButton {background-color: gray}")
+        d._write_buttons["update_program_num"].setStyleSheet("QPushButton {background-color: gray}")
+        d._write_buttons["update_units"].setStyleSheet("QPushButton {background-color: gray}")
+
 
 # ======================================================================================================================
 
 
-class Register:
-    """
-    The value stored in _value is always an int, and always formatted to exactly match what the dispenser
-    expects.  i.e. it is scaled appropriately.
-
-    The setter/getter for the attribute value uses parse/format to convert the raw _value into a more
-    user friendly format.
-
-    The _raw_set_value's job is to update the UI element and send a write command to the dispenser, if applicable.
-    """
-    def __init__(self, master_widget, name, min, max, dtype, read_index, write_index=None, scale=1, unit_type=None):
-        self._name = name
-        self._read_index = read_index
-        self._write_index = write_index
-        self._scale = scale
-        self._value = 0
-        self._unit_type = unit_type
-        self._master_widget = master_widget
-        if dtype in {int, float}:
-            self._dtype = dtype
-        else:
-            raise ValueError(f"Register {name}: dtype must be int or float.")
-        self._validator = self._get_validator(min, max)
-        self._label_base = self._name.replace('_', ' ').title()
-        self._label = qtw.QLabel(self._label_base)
-        self._edit_box = None
-
-        self.write_successful = RegisterWriteSuccess()
-        self.write_failed = RegisterWriteFailure()
-
-    def format(self, value):
-        return self._dtype(value / self._scale)
-
-    def parse(self, value):
-        if self._dtype is int:
-            return int(value) * self._scale
-        else:
-            return round(float(value) * self._scale)
-
-    def make_widget(self):
-        widget = qtw.QWidget()
-        layout = qtw.QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        widget.setLayout(layout)
-
-        layout.addWidget(self._label)
-        # If the unit type is a string, might as well update it once now.  Will never need to be updated again
-        if type(self._unit_type) is str:
-            self._label_units()
-        if self._write_index is None:
-            self._edit_box = qtw.QLabel("")
-        else:
-            self._edit_box = qtw.QLineEdit("")
-            if self._validator is not None:
-                self._edit_box.setValidator(self._validator)
-            self._edit_box.editingFinished.connect(self._editing_finished)
-            self._edit_box.textChanged.connect(self._text_changed)
-        layout.addWidget(self._edit_box)
-        layout.addStretch()
-
-        return widget
-
-    def _get_validator(self, min, max):
-        if self._dtype is int:
-            return qtg.QIntValidator(min, max)
-        else:  # dtype is float
-            return qtg.QDoubleValidator(min, max, 8)
-
-    @property
-    def writable(self):
-        return self._write_index is None
-
-    def _raw_set_value(self, val, do_write=True):
-        self._value = val
-        if self._edit_box is not None:
-            self._edit_box.setText(str(self.format(val)))
-        if do_write and self._write_index is not None:
-            self._master_widget._try_write_register(self._write_index)
-
-    def _label_units(self):
-        if self._unit_type is None:
-            return
-        if type(self._unit_type) is str:
-            units = self._unit_type
-        else:
-            units = self._master_widget.registers[Dispenser.READ_REGISTERS[self._unit_type]].value
-        self._label.setText(self._label_base + f" ({units})")
-
-    def _editing_finished(self):
-        self.value = self._edit_box.text()
-
-    def _text_changed(self):
-        if self._validator is None:
-            return
-        if self._validator.validate(self._edit_box.text(), 0)[0] == qtg.QValidator.Acceptable:
-            self._edit_box.setStyleSheet("QLineEdit { background-color: white}")
-        else:
-            self._edit_box.setStyleSheet("QLineEdit { background-color: pink}")
-
-    @property
-    def value(self):
-        return self.format(self._value)
-
-    @value.setter
-    def value(self, val):
-        if self._edit_box is not None and self._validator is not None:
-            if self._validator.validate(str(val), 0)[0] != qtg.QValidator.Acceptable:
-                raise ValueError(f"Register {self._name} value {val} is out of bounds.")
-
-        val = self.parse(val)
-        if self._write_index is None:
-            raise AttributeError(f"Register {self._name} cannot be written to.")
-        else:
-            self._raw_set_value(val)
-
-    def to_bytes(self):
-        return f"{self._value}".encode("utf-8")
-
-    def _notify_success(self):
-        self.write_successful.emit(self._name)
-
-    def _notify_failure(self, cause):
-        self.write_failed.emit((self._name, cause))
-
-
 class DigitalRegister:
     INDICATOR_SIZE = 20
+    digital_update_register = 0x0000
+    _write_bits = {
+        "trigger": 0x0001,
+        "e_stop": 0x0002,
+        "sleep": 0x0004,
+        "delete_log_1": 0x0008,
+        "set_datetime": 0x0010,
+        "update_program_params": 0x0020,
+        "update_program_num": 0x0040,
+        "update_units": 0x0080,
+        "delete_log_2": 0x0800,
+    }
+    _read_bits = {
+        "running": 0x1,
+        "e_stop_active": 0x2,
+        "sleeping": 0x4,
+        "log_full": 0x8
+    }
 
     def __init__(self, master_widget, name, read_index, write_index):
         self._name = name
@@ -854,24 +792,7 @@ class DigitalRegister:
         self._read_value = 0x0
         self._write_value = 0x0
 
-        self._read_bits = {
-            "running": 0x1,
-            "e_stop_active": 0x2,
-            "sleeping": 0x4,
-            "log_full": 0x8
-        }
         self._read_indicators = {}
-        self._write_bits = {
-            "trigger": 0x0001,
-            "e_stop": 0x0002,
-            "sleep": 0x0004,
-            "delete_log_1": 0x0008,
-            "set_datetime": 0x0010,
-            "update_program_params": 0x0020,
-            "update_program_num": 0x0040,
-            "update_units": 0x0080,
-            "delete_log_2": 0x0800,
-        }
         self._write_buttons = {}
 
         self.write_successful = RegisterWriteSuccess()
@@ -904,14 +825,15 @@ class DigitalRegister:
         layout.addWidget(qtw.QLabel("Read Bits"), 0, 3, 1, 2)
         for name, mask in self._read_bits.items():
             layout.addWidget(qtw.QLabel(name.replace('_', ' ').title()), read_row, 3, 1, 1)
-            button = qtw.QPushButton("")
-            button.setEnabled(False)
-            button.setStyleSheet("QPushButton {background-color: gray}")
-            button.setMinimumWidth(self.INDICATOR_SIZE)
-            button.setMaximumWidth(self.INDICATOR_SIZE)
-            button.setMaximumHeight(self.INDICATOR_SIZE)
-            layout.addWidget(button, read_row, 4, 1, 1)
-            self._read_indicators[name] = button
+            indicator = qtw.QWidget()
+            indicator.setStyleSheet("background-color: gray;")
+            indicator.setMinimumWidth(self.INDICATOR_SIZE)
+            indicator.setMaximumWidth(self.INDICATOR_SIZE)
+            indicator.setMaximumHeight(self.INDICATOR_SIZE)
+            indicator.setMinimumHeight(self.INDICATOR_SIZE)
+            indicator.setAutoFillBackground(True)
+            layout.addWidget(indicator, read_row, 4, 1, 1)
+            self._read_indicators[name] = indicator
             read_row += 1
 
         write_row = 1
@@ -962,9 +884,9 @@ class DigitalRegister:
         self._read_value = val
         for name, mask in self._read_bits.items():
             if self._read_value & mask:
-                self._read_indicators[name].setStyleSheet("QPushButton {background-color: green}")
+                self._read_indicators[name].setStyleSheet("background-color: green;")
             else:
-                self._read_indicators[name].setStyleSheet("QPushButton {background-color: gray}")
+                self._read_indicators[name].setStyleSheet("background-color: gray;")
 
         # Fire off all the events when flags change
         mask = self._read_bits["running"]
@@ -1033,6 +955,135 @@ class DigitalRegister:
         self._master_widget._try_write_register(self._write_index, callback, error_callback, name)
 
 
+class Register:
+    """
+    The value stored in _value is always an int, and always formatted to exactly match what the dispenser
+    expects.  i.e. it is scaled appropriately.
+
+    The setter/getter for the attribute value uses parse/format to convert the raw _value into a more
+    user friendly format.
+
+    The _raw_set_value's job is to update the UI element and send a write command to the dispenser, if applicable.
+    """
+    def __init__(
+        self, master_widget, name, min, max, dtype, read_index, write_index=None, scale=1, unit_type=None,
+        digital_update_register=0x0000
+    ):
+        self._name = name
+        self._read_index = read_index
+        self._write_index = write_index
+        self._scale = scale
+        self._value = 0
+        self._unit_type = unit_type
+        self._master_widget = master_widget
+        self.digital_update_register = digital_update_register
+        if dtype in {int, float}:
+            self._dtype = dtype
+        else:
+            raise ValueError(f"Register {name}: dtype must be int or float.")
+        self._validator = self._get_validator(min, max)
+        self._label_base = self._name.replace('_', ' ').title()
+        self._label = qtw.QLabel(self._label_base)
+        self._edit_box = None
+
+        self.write_successful = RegisterWriteSuccess()
+        self.write_failed = RegisterWriteFailure()
+
+    def format(self, value):
+        return self._dtype(value / self._scale)
+
+    def parse(self, value):
+        if self._dtype is int:
+            return int(value) * self._scale
+        else:
+            return round(float(value) * self._scale)
+
+    def make_widget(self):
+        widget = qtw.QWidget()
+        layout = qtw.QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        widget.setLayout(layout)
+
+        layout.addWidget(self._label)
+        # If the unit type is a string, might as well update it once now.  Will never need to be updated again
+        if type(self._unit_type) is str:
+            self._label_units()
+        if self._write_index is None:
+            self._edit_box = qtw.QLabel("")
+        else:
+            self._edit_box = qtw.QLineEdit("")
+            if self._validator is not None:
+                self._edit_box.setValidator(self._validator)
+            self._edit_box.editingFinished.connect(self._editing_finished)
+            self._edit_box.textChanged.connect(self._text_changed)
+        layout.addWidget(self._edit_box)
+        layout.addStretch()
+
+        return widget
+
+    def _get_validator(self, min, max):
+        if self._dtype is int:
+            return qtg.QIntValidator(min, max)
+        else:  # dtype is float
+            return qtg.QDoubleValidator(min, max, 8)
+
+    @property
+    def writable(self):
+        return self._write_index is None
+
+    def _raw_set_value(self, val, do_write=True):
+        self._value = val
+        if self._edit_box is not None and not self._edit_box.hasFocus():
+            self._edit_box.setText(str(self.format(val)))
+        if do_write and self._write_index is not None:
+            self._master_widget._try_write_register(self._write_index)
+
+    def _label_units(self):
+        if self._unit_type is None:
+            return
+        if type(self._unit_type) is str:
+            units = self._unit_type
+        else:
+            units = self._master_widget.registers[Dispenser.READ_REGISTERS[self._unit_type]].value
+        self._label.setText(self._label_base + f" ({units})")
+
+    def _editing_finished(self):
+        self.value = self._edit_box.text()
+
+    def _text_changed(self):
+        if self._validator is None:
+            return
+        if self._validator.validate(self._edit_box.text(), 0)[0] == qtg.QValidator.Acceptable:
+            self._edit_box.setStyleSheet("QLineEdit { background-color: white}")
+        else:
+            self._edit_box.setStyleSheet("QLineEdit { background-color: pink}")
+
+    @property
+    def value(self):
+        return self.format(self._value)
+
+    @value.setter
+    def value(self, val):
+        if self._edit_box is not None and self._validator is not None:
+            if self._validator.validate(str(val), 0)[0] != qtg.QValidator.Acceptable:
+                raise ValueError(f"Register {self._name} value {val} is out of bounds.")
+
+        val = self.parse(val)
+        if self._write_index is None:
+            raise AttributeError(f"Register {self._name} cannot be written to.")
+        else:
+            self._raw_set_value(val)
+
+    def to_bytes(self):
+        return f"{self._value}".encode("utf-8")
+
+    def _notify_success(self):
+        self.write_successful.emit(self._name)
+
+    def _notify_failure(self, cause):
+        self.write_failed.emit((self._name, cause))
+
+
 class ModelTypeRegister(Register):
     @staticmethod
     def format(value):
@@ -1098,14 +1149,20 @@ class TimeRegister(Register):
 
 
 class SelectableRegister(Register):
-    def __init__(self, master_widget, name, choices, read_index, write_index, scale=1, selection_callback=None):
+    def __init__(
+        self, master_widget, name, choices, read_index, write_index, scale=1, selection_callback=None,
+        digital_update_register=0x0000
+    ):
         self._choices = choices
         self._selector = None
         self._parser = {v: k for k, v in choices.items()}
         self._selection_callback = selection_callback
         keys = np.array(tuple(choices.keys()), dtype=np.int32)
         min_key, max_key = np.amin(keys), np.amax(keys)
-        super().__init__(master_widget, name, min_key, max_key, int, read_index, write_index=write_index, scale=scale)
+        super().__init__(
+            master_widget, name, min_key, max_key, int, read_index, write_index=write_index, scale=scale,
+            digital_update_register=digital_update_register
+        )
 
     def format(self, value):
         return self._choices[value]
