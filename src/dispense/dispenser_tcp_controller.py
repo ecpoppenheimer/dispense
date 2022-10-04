@@ -1,5 +1,5 @@
 import queue
-import types
+import time
 
 import PyQt5.QtWidgets as qtw
 import PyQt5.QtGui as qtg
@@ -9,51 +9,112 @@ import numpy as np
 
 from epyqtwidgets.ip4validator import IP4Validator
 import epyqtsettings.settings_widgets as sw
+from epyqtsettings.settings import Settings
+from epyqtwidgets.indicator import Indicator
+
+STUPID_TIME_DELAY = .02
 
 
 class Dispenser:
     """
-    Public Methods
-    --------------
-    make_ui_widget
-    connect
-    disconnect
-    shut_down
-    read
-    write
-    do_deferred_writes
-    set_system_time
-    data_changed
-    time_changed
-    get_digital
-    read_digital
-    set_digital
-    check_write_digital
+    API for a Nordson UltimusPlus fluid dispenser.  Fully asynchronous.
 
-    Public Attributes
-    -----------------
-    settings
-    registers
-    defer_read
-    defer_write
-    digitals_names
-    polling_period
-    polling_active
+    This class takes care of the networking tasks required to communicate with the dispenser.  It can be used headless
+    but also provides method to construct PyQt5 Widgets that can be used to build a UI.
+
+    The registers used by the dispenser are available as public attributes read_registers and write_registers,
+    and they can be read from and written to with the public methods read(), write(), and pulse().  These operations are
+    basic, and work on the raw, unformatted values used by the dispenser.  A more user-friendly interface is provided
+    through read/write public properties.  These properties are formatted into more user-friendly values.
+
+    Accessing these properties does not trigger a networking operation.  Their values are cached from the last time a
+    read or poll command was sent to the dispenser.  You can ensure that the value is fresh by calling read() and
+    passing a callback - if the callback is called then accessing readable registers will return fresh values.
+
+    Setting a writable property does trigger a networking operation to update the value on the physical dispenser.
+    Many of the write operations require one of the corresponding digital registers to be set alongside the numerical
+    register value.  This process is handled automatically by the property, and means three individual networking
+    operations will be executed for most property write calls.  Property writes do not provide assurance that the update
+    was received and acknowledged by the physical dispenser.  If this is required, use the equivalent set method
+    and provide a callback.  When the callback is triggered, the value has been guaranteed to have been accepted by
+    the physical dispenser.  These methods may also take an error_callback which is called if the write operation fails
+    for some reason.
+
+    Read only boolean properties
+        dispensing
+        e_stop
+        sleep
+        log_full
+
+    Write only boolean properties
+        trigger
+        e_stop
+        sleep
+
+    Read only properties
+        model_type: str, {"UltimusPlus-NX "I", "UltimusPlus-NX II"}
+        system_count: int
+        shot_count: int
+        software_version: float
+
+    Read-write properties
+        program_num: int {1-16}
+        dispense_mode: int or str, {1-4} or {"Single Shot", "Steady Mode", "MultiShot"}
+            3: "Teach Mode" is a valid read value, but invalid write value.
+        dispense_time: float
+        pressure_units: int or str, {0-2} or {"psi", "bar", "kPa"}
+        pressure: float
+        vacuum_units: int or str, {0-2} or {"in water", "in Hg", "kPa"}
+        vacuum: float
+        multishot_count: int
+        multishot_time: float
+        system_date: int, in format YYYYMMDD
+        system_time: int, in format HHMMSS
+
+    The write-only boolean registers are not settable properties, but callable methods that pulse the associated
+    boolean register.  These methods accept callbacks that fire when the pulse has been acknowledged as received.
+    These do not have a corresponding set_ method - they are the set method without set_ in the name.
+    Write only boolean properties
+        delete_log
+        update_datetime
+        update_params
+        update_program_num
+        update_units
+
+    The ideal way to trigger depends on dispense mode.  For steady mode, setting and clearing trigger is the way
+    to go.  In single shot or multi shot mode, It is better to use a pulse, for which a convenience function is provided
+        trigger_shot
+
+    Each readable register also has a PyQt signal that is fired whenever the register's value changes, which can
+    be connected to any number of PyQt slots.  This signal's name is {register_name}_changed
+
+    This class can be set to automatically poll the physical dispenser and update the read register values.  This
+    behavior can be enabled via the poll property, and the polling period can be set by the polling_period property.
+    These both have _changed signals that fire with the new value whenever one of these properties is changed.
+
+    There is a connection_event that is fired whenever the connection state to the physical dispenser changes, and
+    receives one of four values: Dispenser.CONNECTED = 1, Dispenser.CONNECTING = 2, Dispenser.DISCONNECTED = 3,
+    or Dispenser.CONNECTION_ERROR = 4
+
     """
-    """
-    It is tricky to design an interface to this dispenser that doesn't block on sending a command and sensibly handles
-    errors.  For every command sent, we should receive either a copy of the command, or an error message, and all
-    responses *should* occur in order.  I don't know if this will happen in practice, but at the moment I am going to
-    rely on responses being returned in order and use a queue to make sure that each response sent is either
-    acknowledged as good or as an error.  In theory, errors should only ever even get sent if this class sends a
-    malformed message, so with good design they shouldn't even happen, but I am going to try to account for them anyway.
-    """
+
     _initialized = False
     DEFAULT_PORT = 9000
 
     # Commands to send to the dispenser.
     READ = 3
     WRITE = 16
+
+    # Actions that can be fed to the queue
+    POLL = 1
+    PULSE = 2
+
+    COMMAND_LUT = {
+        READ: "read",
+        WRITE: "write",
+        POLL: "poll",
+        PULSE: "pulse"
+    }
 
     # Commands received from the dispenser.
     # Sucessful read returns a 3
@@ -106,6 +167,9 @@ class Dispenser:
         "vacuum_units",
         "time_format",
     ]
+    READ_ONLY_REGISTERS = ["model_type", "system_count", "shot_count", "software_version"]
+
+    READ_INDICES = np.arange(READ_REG_COUNT)
     WRITE_REG_COUNT = 12
     WRITE_REGISTERS = [
         "digitals",
@@ -122,31 +186,84 @@ class Dispenser:
         "system_time",
     ]
     WRITE_INDICES = np.arange(WRITE_REG_COUNT)
+    DIGITAL_WRITE_REGISTERS = {
+        "trigger": 0x0001,
+        "e_stop": 0x0002,
+        "sleep": 0x0004,
+        "delete_log": 0x0808,
+        "update_datetime": 0x0010,
+        "update_params": 0x0020,
+        "update_program_num": 0x0040,
+        "update_units": 0x0080,
+    }
+    MAP_WRITE_TO_READ = [0, 2, 3, 4, 14, 5, 15, 6, 9, 10, 11, 12]
 
-    def __init__(self, settings, ip=None, port=None):
-        self.settings = settings
-        self._data = b""
+    # Connection state
+    CONNECTED = 1
+    CONNECTING = 2
+    DISCONNECTED = 3
+    CONNECTION_ERROR = 4
+
+    def __init__(self, settings=None, ip=None, port=None, autoconnect=True):
+        self._data_stream = b""
         if ip is None:
             ip = "localhost"
         if port is None:
             port = self.DEFAULT_PORT
-        self.settings.establish_defaults(
-            dispenser_port=port, dispenser_ip=ip, polling_active=True, polling_period=1.0
-        )
+
+        # settings is optional.  Will make a temporary one if None was specified.
+        if settings is None:
+            self.settings = Settings()
+            self.settings.establish_defaults(
+                dispenser_port=port, dispenser_ip=ip, polling_active=True, polling_period=1.0, save_settings=False
+            )
+        else:
+            self.settings = settings
+            self.settings.establish_defaults(
+                dispenser_port=port, dispenser_ip=ip, polling_active=True, polling_period=1.0, save_settings=True
+            )
+
+        self.read_registers = -1 * np.ones((self.READ_REG_COUNT,), dtype=np.int64)
+        self.write_registers = np.zeros((self.WRITE_REG_COUNT,), dtype=np.int64)
+
+        # Read register changed events
+        self.digitals_changed = IntChanged()
+        self.dispensing_changed = FlagChanged()
+        self.e_stop_active_changed = FlagChanged()
+        self.sleeping_changed = FlagChanged()
+        self.log_full_changed = FlagChanged()
+        self.model_type_changed = StrChanged()
+        self.program_num_changed = IntChanged()
+        self.dispense_mode_changed = StrChanged()
+        self.dispense_time_changed = FloatChanged()
+        self.pressure_changed = FloatChanged()
+        self.vacuum_changed = FloatChanged()
+        self.system_count_changed = IntChanged()
+        self.shot_count_changed = IntChanged()
+        self.multishot_count_changed = IntChanged()
+        self.multishot_time_changed = FloatChanged()
+        self.system_date_changed = IntChanged()
+        self.system_time_changed = IntChanged()
+        self.software_version_changed = IntChanged()
+        self.pressure_units_changed = StrChanged()
+        self.vacuum_units_changed = StrChanged()
+        self.time_format_changed = StrChanged()
+
         self.connection_event = ConnectionChanged()
+        self._connection_state = self.DISCONNECTED
 
         self._server_socket = None
-        self._ui = types.SimpleNamespace()
-        self._connection_ready = False
         self._debug = False
         self._polling_timer = qtc.QTimer()
-        self.polling_period = self.settings.polling_period
-        self._polling_timer.timeout.connect(self._read_all)
-        self._polling_active = self.settings.polling_active
+        self._polling_period = self.settings.polling_period
+        self._polling_timer.timeout.connect(self._do_poll)
+        self._polling_active = False
+        self._poll_queued = False
+        self.poll_changed = FlagChanged()
+        self.poll_period_changed = FloatChanged()
+        self.poll = self.settings.polling_active
 
-        # Define the registers.  These are objects that handle all formatting and type checking, and act as
-        # public attributes of the class that can be read and written (if appropriate), and will automatically trigger
-        # TCP communications, unless the defer flags are set.
+        """
         self.registers = {}
         self.registers.update({
             "digitals": DigitalRegister(self, "digitals", 0, 0),
@@ -203,1043 +320,1339 @@ class Dispenser:
         self._write_registers_by_index = [self.registers[name] for name in self.WRITE_REGISTERS]
         self._read_registers_by_index = [self.registers[name] for name in self.READ_REGISTERS]
         self._register_keys = set(self.registers.keys())
-        self._deferred_writes = np.zeros((self.WRITE_REG_COUNT,), dtype=bool)
+        self._deferred_writes = np.zeros((self.WRITE_REG_COUNT,), dtype=bool)"""
 
         # Message queue.  Messages should be added here as a tuple of (data, callback), and the callback will
         # be fired when the message is acknowledged.
-        self._message_queue = queue.Queue()
-        self._initialized = True
-
-        self._make_ui_widget()
-
-    @property
-    def ui_widget(self):
-        return self._ui.base_widget
-
-    def _make_ui_widget(self):
-        self._ui.base_widget = qtw.QWidget()
-        layout = qtw.QGridLayout()
-        self._ui.base_widget.setLayout(layout)
-        ui_row = 0
-
-        # IP controls
-        self._ui.ip_entry = sw.SettingsEntryBox(self.settings, "dispenser_ip", str, validator=IP4Validator())
-        self._ui.ip_entry.edit_box.textChanged.connect(self._ip_changed)
-        layout.addWidget(self._ui.ip_entry, ui_row, 0, 1, 12)
-        ui_row += 1
-
-        self._ui.port_entry = sw.SettingsEntryBox(
-            self.settings, "dispenser_port", int, validator=qtg.QIntValidator(0, 65535)
-        )
-        layout.addWidget(self._ui.port_entry, ui_row, 0, 1, 12)
-        ui_row += 1
-
-        self._ui.connect_button = qtw.QPushButton("Connect")
-        self._ui.connect_button.clicked.connect(self._click_connect)
-        layout.addWidget(self._ui.connect_button, ui_row, 0, 1, 4)
-
-        # Check box to show the registers
-        self._ui.show_registers = qtw.QCheckBox("Show Registers")
-        self._ui.show_registers.setChecked(0)
-        self._ui.show_registers.setTristate(False)
-        self._ui.show_registers.stateChanged.connect(self._set_show_registers)
-        layout.addWidget(self._ui.show_registers, ui_row, 6, 1, 3)
-
-        # Test button
-        self._ui.test_button = qtw.QPushButton("Test")
-        if self._debug:
-            self._ui.test_button.clicked.connect(self._run_test)
-            layout.addWidget(self._ui.test_button, ui_row, 9, 1, 3)
-        ui_row += 1
-
-        self._ui.reg_widget = qtw.QWidget()
-        self._ui.reg_widget.hide()
-        reg_layout = qtw.QGridLayout()
-        reg_ui_row = 0
-        self._ui.reg_widget.setLayout(reg_layout)
-        layout.addWidget(self._ui.reg_widget, ui_row, 0, 1, 12)
-        ui_row += 1
-
-        # Controls for deferred read/write
-        self._ui.defer_read_checkbox = qtw.QCheckBox("Defer Reads")
-        self._ui.defer_read_checkbox.setChecked(0)
-        self._ui.defer_read_checkbox.setTristate(False)
-        reg_layout.addWidget(self._ui.defer_read_checkbox, reg_ui_row, 0, 1, 3)
-
-        self._ui.read_button = qtw.QPushButton("Read All")
-        self._ui.read_button.clicked.connect(self._read_all)
-        self._ui.read_button.setEnabled(False)
-        reg_layout.addWidget(self._ui.read_button, reg_ui_row, 3, 1, 3)
-
-        self._ui.defer_write_checkbox = qtw.QCheckBox("Defer Writes")
-        self._ui.defer_write_checkbox.setChecked(0)
-        self._ui.defer_write_checkbox.setTristate(False)
-        self._ui.defer_write_checkbox.stateChanged.connect(self._clicked_defer_write)
-        reg_layout.addWidget(self._ui.defer_write_checkbox, reg_ui_row, 6, 1, 3)
-
-        self._ui.do_defer_write_button = qtw.QPushButton("Write Now")
-        self._ui.do_defer_write_button.setEnabled(False)
-        self._ui.do_defer_write_button.clicked.connect(self.do_deferred_writes)
-        reg_layout.addWidget(self._ui.do_defer_write_button, reg_ui_row, 9, 1, 3)
-        reg_ui_row += 1
-
-        # Polling controls
-        def set_polling_period():
-            self.polling_period = self.settings.polling_period
-
-        def set_polling_active():
-            self.polling_active = self.settings.polling_active
-
-        self._ui.polling_active_entry = sw.SettingsCheckBox(
-            self.settings, "polling_active", "Activate Read Polling", callback=set_polling_active
-        )
-        reg_layout.addWidget(self._ui.polling_active_entry, reg_ui_row, 0, 1, 6)
-
-        self._ui.polling_period_entry = sw.SettingsEntryBox(
-            self.settings, "polling_period", float, qtg.QDoubleValidator(.001, 1000, 3), set_polling_period
-        )
-        reg_layout.addWidget(self._ui.polling_period_entry, reg_ui_row, 6, 1, 6)
-        reg_ui_row += 1
-
-        # Date time widget is separate from the register widgets, since this is a single widget to control two
-        # registers.  The registers will hold the real value, and this widget will send/receive updates to the values
-        # held by those registers.
-        reg_layout.addWidget(qtw.QLabel("Dispenser Time"), reg_ui_row, 0, 1, 3)
-        self._ui.date_time_picker = qtw.QDateTimeEdit()
-        self._ui.date_time_picker.setCalendarPopup(True)
-        self._ui.date_time_picker.setMinimumDate(qtc.QDate(1901, 12, 13))
-        self._ui.date_time_picker.setMaximumDate(qtc.QDate(2038, 1, 19))
-        self._ui.date_time_picker.dateChanged.connect(self.date_changed)
-        self._ui.date_time_picker.timeChanged.connect(self.time_changed)
-        reg_layout.addWidget(self._ui.date_time_picker, reg_ui_row, 3, 1, 6)
-        self._ui.now_time_button = qtw.QPushButton("Get Time")
-        self._ui.now_time_button.clicked.connect(self.set_system_time)
-        reg_layout.addWidget(self._ui.now_time_button, reg_ui_row, 9, 1, 3)
-        reg_ui_row += 1
-
-        # The register widgets
-        for r in self.registers.values():
-            w = r.make_widget()
-            if w is not None:
-                reg_layout.addWidget(w, reg_ui_row, 0, 1, 12)
-                reg_ui_row += 1
-        self.registers["digitals"].set_enabled(False)
-
-        return self._ui.base_widget
+        self._action_queue = queue.Queue()
+        self._pending_action = None
+        if autoconnect:
+            self.connect()
 
     def connect(self, address=None, port=None):
         if address is None:
             address = self.settings.dispenser_ip
         if port is None:
             port = self.settings.dispenser_port
-        self._server_socket = qtn.QTcpSocket(self._ui.base_widget)
+        self._server_socket = qtn.QTcpSocket()
         self._server_socket.connectToHost(address, port)
         self._server_socket.connected.connect(self._got_connection)
 
-    def _click_connect(self):
-        if self._server_socket is None:
-            self.connect()
-            self._ui.connect_button.setText("Working...")
-        else:
-            self.disconnect()
+        self._set_connection_state(self.CONNECTING)
 
-    def _got_connection(self):
-        if self._server_socket is not None:
-            self._ui.connect_button.setText("Disconnect")
-            self._server_socket.disconnected.connect(self.disconnect)
-            self._server_socket.errorOccurred.connect(self._socket_error)
-            self._server_socket.readyRead.connect(self._read_chunks)
-            self._ui.read_button.setEnabled(True)
-            self.registers["digitals"].set_enabled(True)
-            self.read(callback=self._initial_read_completed)
-            self.connection_event.emit(True)
-
-    def _initial_read_completed(self, _):
-        self._connection_ready = True
-        self.set_system_time()
-        self._try_toggle_polling()
-
-    def _ip_changed(self):
-        state = self._ui.ip_entry.edit_box.validator().validate(self._ui.ip_entry.edit_box.text(), 0)[0]
-        if state == qtg.QValidator.Acceptable:
-            color = "white"
-        else:
-            color = "pink"
-        self._ui.ip_entry.setStyleSheet("QLineEdit { background-color: %s }" % color)
-
-    def disconnect(self):
+    def disconnect(self, _error=False):
         if self._server_socket is not None:
             self._server_socket.close()
         self._server_socket = None
-        self._ui.read_button.setEnabled(False)
-        self._ui.defer_write_checkbox.setChecked(0)
-        self._ui.defer_read_checkbox.setChecked(0)
-        self._ui.do_defer_write_button.setEnabled(False)
-        self._ui.connect_button.setText("Connect")
-        self.registers["digitals"].set_enabled(False)
-        self._connection_ready = False
-        self._try_toggle_polling()
-        self.connection_event.emit(False)
+        if _error:
+            self._set_connection_state(self.CONNECTION_ERROR)
+        else:
+            self._set_connection_state(self.DISCONNECTED)
 
     def shut_down(self):
         self.disconnect()
 
-    def _socket_error(self, error):
-        print(f"received socket error: {error}")
-        self.disconnect()
+    def _got_connection(self):
+        if self._server_socket is not None:
+            self._server_socket.disconnected.connect(self.disconnect)
+            self._server_socket.errorOccurred.connect(self._socket_error)
+            self._server_socket.readyRead.connect(self._read_chunks)
+            self._set_connection_state(self.CONNECTED)
+
+            # Things to do when a new connection is initialized
+            self.get_datetime()
+            self.read()
+
+    def _socket_error(self, _error):
+        self.disconnect(_error=True)
+        # TODO crashes after reaching this point, without a traceback, only an exit code
+
+    def make_connection_widget(self):
+        return DispenserConnectionWidget(self)
+
+    def make_polling_widget(self):
+        return DispenserPollingWidget(self)
+
+    def make_read_only_widget(self, registers=None):
+        if registers is None:
+            registers = self.READ_ONLY_REGISTERS
+        elif registers in self.READ_ONLY_REGISTERS:
+            return ReadOnlyWidget(self, registers)
+        elif set(registers).issubset(self.READ_ONLY_REGISTERS):
+            pass
+        else:
+            raise ValueError(
+                "Dispenser make_read_only_widget: registers must be a single string register, a subset of Dispenser."
+                "READ_ONLY_REGISTERS, or None."
+            )
+
+        w = qtw.QWidget()
+        layout = qtw.QVBoxLayout()
+        w.setLayout(layout)
+        for r in registers:
+            layout.addWidget(ReadOnlyWidget(self, r))
+        return w
+
+    def make_date_time_widget(self):
+        return DateTimeWidget(self)
+
+    def make_params_widget(self):
+        return ParamsWidget(self)
+
+    def make_digitals_widget(self, show_log=False, horizontal=True):
+        return DigitalsWidget(self, show_log, horizontal)
+
+    def make_trigger_widget(self):
+        return TriggerWidget(self)
+
+    @property
+    def connection_state(self):
+        return self._connection_state
+
+    def _set_connection_state(self, state):
+        self._connection_state = state
+        self.connection_event.emit(state)
 
     def _read_chunks(self):
+        """
+        This function parses the data stream to get data from the dispenser.  This handles both reading data
+        via read commands, and acknowledging write commands.  The read result is its own acknowledgement.
+
+        This function also consumes elements from the action queue.  Only one command should ever be sent to the
+        dispenser at once, although many may be queued in the action queue.  This is so we can guarantee acknowledging
+        each requested action, and route everything to the correct place.  The while loop inside this function SHOULD
+        only ever trigger once, as there should only ever be a single message per call.
+
+        This function will send additional messages to the dispenser if there is more than one element in the action
+        queue.
+        """
         if self._server_socket is None:
             return
 
-        self._data += self._server_socket.read(self._server_socket.bytesAvailable())
-        delimiter_pos = self._data.find(b';')
+        # I am keeping the code to read in multiple chunks at a time for robustness, even though the action queue
+        # should prevent more than one message from ever being queued up.
+        self._data_stream += self._server_socket.read(self._server_socket.bytesAvailable())
+        delimiter_pos = self._data_stream.find(b';')
         while delimiter_pos > 0:
-            chunk = self._data[:delimiter_pos]
+            chunk = self._data_stream[:delimiter_pos]
             print(f"[SERVER] {str(chunk)}")
             chunk_data = np.asarray(chunk.split(b','))
             chunk_data =tuple(int(b.decode("utf-8")) for b in chunk_data)
-            self._data = self._data[delimiter_pos + 1:]
-            delimiter_pos = self._data.find(b';')
+            self._data_stream = self._data_stream[delimiter_pos + 1:]
+            delimiter_pos = self._data_stream.find(b';')
 
-            # Match this chunk to the message queue, to make sure that the message was correctly acknowledged, or
-            # forward the error if an error was received.
-            original_message, callback, error_callback, digital, update_registers = self._message_queue.get()
-
-            if np.all(chunk_data[:3] == original_message[:3]):
-                # command was successful
-                if chunk_data[0] == self.READ:
-                    self._update_ui(chunk_data[3:], original_message)
-                    if callback is not None:
-                        if digital is not None:
-                            callback(digital, self.get_digital(digital))
-                        else:
-                            labeled_data = self._unpack(chunk_data[1:], self.READ_REGISTERS)
-                            callback(labeled_data)
-                else:  # Should only ever reach here if header[0] == self.WRITE
-                    self._notify_registers(original_message, True)
-                    if update_registers == 0x8000:
-                        # This is a sentinel value, no digital register has this mask.  This write command was an
-                        # update_registers command, so now need to clear ALL of the update registers.
-                        self._close_update_signals()
-                    elif update_registers != 0x0000:
-                        # Some registers need to pulse one of the digital registers for the update to take effect.
-                        self._message_queue.put(((self.WRITE, 0, 1), None, None, None, 0x8000))
-                        d_val = self._write_registers_by_index[0]._write_value | update_registers
-                        message = f"{self.WRITE},0,1,{d_val};".encode("utf-8")
-                        self._server_socket.write(message)
-                        print(f"[CLIENT] {message}")
-                    if callback is not None:
-                        if digital is not None:
-                            callback(digital, self.registers["digitals"].check_write_value(digital))
-                        else:
-                            labeled_data = self._unpack(chunk_data[1:], self.WRITE_REGISTERS)
-                            callback(labeled_data)
+            # This data chunk should correspond to the first item in the action queue
+            if self._pending_action is None:
+                print(f"Dispenser: Warning, ignored an unexpected chunk of data (no action was queued) {chunk_data}")
             else:
-                # command was not successful, so determine what kind of error happened
-                try:
-                    error_command, error_code = chunk[0], chunk[1]
-                except Exception as e:
-                    raise RuntimeError(f"Dispenser: could not interpret error code.  {chunk}") from e
-
-                original_command = original_message[0]
-                if original_command == self.WRITE and error_command == self.WRITE_ERROR:
-                    self._notify_registers(original_message, False, self.ERROR_CODES[error_code])
-                    print(f"Dispenser: write error successfully caught.")
-                elif original_command == self.READ and error_command == self.READ_ERROR:
-                    print(f"Dispenser: read error successfully caught.")
+                action = self._pending_action[0]
+                if action == self.READ:
+                    self._acknowledge_read(chunk_data)
+                elif action == self.POLL:
+                    self._poll_queued = False
+                    self._acknowledge_read(chunk_data)
+                elif action == self.WRITE or action == self.PULSE:
+                    self._acknowledge_write(chunk_data, action == self.PULSE)
+                    if action == self.PULSE:
+                        time.sleep(STUPID_TIME_DELAY)
                 else:
-                    print(
-                        f"Dispenser: Unknown or inappropriate error code.  Error code is "
-                        f"{error_code}, and original data is {original_message}"
+                    raise RuntimeError(
+                        f"Dispenser: Got an invalid action {action} from the action queue."
                     )
-                if error_callback is not None:
-                    error_callback(self.ERROR_CODES[error_code], original_message)
+            self._pending_action = None
 
-    def _read_all(self):
-        # Stub to consume the arg that the read_button.clicked event seems to be feeding to this function
-        self.read()
+        # Finished acknowledging the pending action.  If there are any actions in the action queue, now is the time
+        # to execute a new one.
+        if not self._action_queue.empty():
+            self._execute_action()
 
-    def read(self, start_register=0, count=None, callback=None, error_callback=None, digital=None):
+    def _acknowledge_read(self, chunk_data):
+        command, callback, error_callback, extra_args = self._pending_action
+        if chunk_data[0] == self.READ:
+            start_register, count = extra_args
+            if chunk_data[1] == start_register and chunk_data[2] == count:
+                new_register_values = chunk_data[3:]
+                for i, new_register_value in zip(range(start_register, start_register + count), new_register_values):
+                    # If and only if the register has changed, update its value and then fire the corresponding
+                    # register_changed event.  Use the register property getter to format the value.
+                    if i == 0:
+                        # Special case for the digitals register, since we need to be able to fire each individual
+                        # flag changed event.
+                        self._emit_digital_changes(new_register_value, self.read_registers[0])
+                    if self.read_registers[i] != new_register_value:
+                        # Do this for all registers, including the digitals register.
+                        self.read_registers[i] = new_register_value
+                        register_name = self.READ_REGISTERS[i]
+                        getattr(self, register_name + "_changed").emit(getattr(self, register_name))
+
+                # Read was sucessful!
+                if callback is not None:
+                    callback(chunk_data)
+            else:
+                print(f"Dispenser: Acknowledging read command but the registers do not match - out of order?")
+                return
+        else:
+            print(
+                f"Dispenser: Error: expected to receive a read acknowledgement, but instead received Chunk data: "
+                f"{chunk_data}, args: {extra_args}"
+            )
+            if error_callback is not None:
+                error_callback(chunk_data)
+
+    def _emit_digital_changes(self, new_value, old_value):
+        new_dig = new_value
+        dig_diff = old_value ^ new_dig
+        if dig_diff & 0x1:
+            self.dispensing_changed.emit(new_dig & 0x1)
+        if dig_diff & 0x2:
+            self.e_stop_active_changed.emit(new_dig & 0x2)
+        if dig_diff & 0x4:
+            self.sleeping_changed.emit(new_dig & 0x4)
+        if dig_diff & 0x8:
+            self.log_full_changed.emit(new_dig & 0x8)
+
+    def _acknowledge_write(self, chunk_data, is_pulse):
+        command, callback, error_callback, extra_args = self._pending_action
+        if chunk_data[0] == self.WRITE:
+            if is_pulse:
+                start_register, count = 0, 1
+            else:
+                start_register, count = extra_args
+            if chunk_data[1] == start_register and chunk_data[2] == count:
+                # Need to emit the changed events.  Need to determine whether the write has changed the value relative
+                # to the last read.  While this could be done by issuing a new read request, or automatic polling, I
+                # would really like to actually use the information in the write request, even though that complicates
+                # things a bit.  Need to map between read register indices and write register indices, since they
+                # do not line up.
+                new_register_values = chunk_data[3:]
+                for write_index, new_register_value in zip(
+                    range(start_register, start_register + count), new_register_values
+                ):
+                    read_index = self.MAP_WRITE_TO_READ[write_index]
+
+                    # Special case for the digitals
+                    if read_index == 0:
+                        self._emit_digital_changes(new_register_value, self.read_registers[read_index])
+
+                    if new_register_value != self.read_registers[read_index]:
+                        self.read_registers[read_index] = new_register_value
+                        register_name = self.READ_REGISTERS[read_index]
+                        getattr(self, register_name + "_changed").emit(getattr(self, register_name))
+
+                # Write was successful!
+                if callback is not None:
+                    callback(chunk_data)
+                return
+
+        print(f"Dispenser: Error acknowledging write.  Chunk data: {chunk_data}, args: {extra_args}")
+        if error_callback is not None:
+            error_callback(chunk_data)
+
+    def _prepare_action(self, action, callback, error_callback, extra_args):
+        """
+        This function adds an action to the action queue.  It should be called by everything that wants to write to
+        the dispenser EXCEPT for _read_chunks, which may execute actions directly if multiple are queued at once.
+
+        If the action queue is empty, this function will send it immediately after enqueueing it.
+        """
+        if self._action_queue.empty() and self._pending_action is None:
+            send_now = True
+        else:
+            send_now = False
+
+        self._action_queue.put((action, callback, error_callback, extra_args))
+        if send_now:
+            self._execute_action()
+
+    def _execute_action(self):
+        """
+        This function encodes the logic for sending messages to the dispenser, but should never be called directly,
+        except by _read_chunks and _prepare_action, which are both responsible for checking whether the action may
+        be executed.
+        Use _prepare_action to put an action in the queue and eventually execute it.
+        """
+        self._pending_action = self._action_queue.get()
+        if self._pending_action[0] == self.POLL and not self._action_queue.empty():
+            # polling actions are always pushed to the back of the queue.  At least... unless there are multiple
+            # floating around.  If there are two polls in a row, one will get executed here, but that is good - it will
+            # ensure all polls eventually get consumed, in case more than one is ever queued by accident.
+            self._action_queue.put(self._pending_action)
+            self._pending_action = self._action_queue.get()
+
+        # Execute the action
+        action, callback, error_callback, extra_args = self._pending_action
+        if action == self.READ or action == self.POLL:
+            start_register, count = extra_args
+            data = f"{self.READ},{start_register},{count};".encode("utf-8")
+            print(f"[CLIENT] {data}")
+            self._server_socket.write(data)
+        elif action == self.WRITE:
+            start_register, count = extra_args
+            data = f"{self.WRITE},{start_register},{count}".encode("utf-8")
+            for i in range(start_register, start_register + count):
+                data += f",{self.write_registers[i]}".encode("utf-8")
+            data += b";"
+            print(f"[CLIENT] {data}")
+            self._server_socket.write(data)
+        elif action == self.PULSE:
+            mask, level = extra_args
+            digitals = int(self.write_registers[0])
+            if level:
+                # pulsing on
+                digitals |= mask
+            else:
+                # pulsing off
+                digitals &= ~mask
+            data = f"{self.WRITE},0,1,{digitals};".encode("utf-8")
+            print(f"[CLIENT] {data}")
+            self._server_socket.write(data)
+
+    def read(self, start_register=0, count=None, callback=None, error_callback=None):
+        """
+        Public but low-level function for reading from the dispenser into the read_registers.
+        """
         if self._server_socket is None:
             return
-        self.defer_read = False
         if count is None:
             count = self.READ_REG_COUNT - start_register
         elif count > self.READ_REG_COUNT - start_register:
             raise ValueError(f"Dispenser.read: count of {count} too high for start register {start_register}.")
+        if start_register < 0 or start_register > self.READ_REG_COUNT:
+            raise ValueError(
+                f"Dispenser.read: start_register {start_register} out of range (0, {self.READ_REG_COUNT})."
+            )
 
-        data = f"{self.READ},{start_register},{count};".encode("utf-8")
-        self._message_queue.put(((self.READ, start_register, count), callback, error_callback, digital, None))
-        print(f"[CLIENT] {data}")
-        self._server_socket.write(data)
+        self._prepare_action(self.READ, callback, error_callback, (start_register, count))
 
-    def write(self, start_register=0, count=None, callback=None, error_callback=None, digital=None):
+    def write(self, start_register=0, count=None, callback=None, error_callback=None):
+        """
+        Public but low-level for sending the values in write registers to the dispenser.
+
+        This function will not pulse the digital flags that are required to set certain registers.  That must be done
+        manually when using this function.  Or just use the writable attributes to feed values to the dispenser.
+        """
         if self._server_socket is None:
             return
-
         if count is None:
             count = self.READ_REG_COUNT - start_register
         elif count > self.READ_REG_COUNT - start_register:
-            raise ValueError(f"Dispenser.read: count of {count} too high for start register {start_register}.")
+            raise ValueError(f"Dispenser.write: count of {count} too high for start register {start_register}.")
+        if start_register < 0 or start_register > self.READ_REG_COUNT:
+            raise ValueError(
+                f"Dispenser.write: start_register {start_register} out of range (0, {self.READ_REG_COUNT})."
+            )
 
-        update_registers = 0x0000
-        data = f"{self.WRITE},{start_register},{count}".encode("utf-8")
-        for i in range(start_register, start_register + count):
-            data += b"," + self._write_registers_by_index[i].to_bytes()
-            update_registers |= self._write_registers_by_index[i].digital_update_register
-        data += b";"
-        self._message_queue.put((
-            (self.WRITE, start_register, count), callback, error_callback, digital, update_registers
-        ))
-        print(f"[CLIENT] {data}")
-        self._server_socket.write(data)
+        self._prepare_action(self.WRITE, callback, error_callback, (start_register, count))
 
-    def do_deferred_writes(self, *_, callback=None, error_callback=None, digital=None):
-        """
-        This function is connected to a push button slot, which causes it to receive a forced parameter it doesn't need,
-        hence the *_
-        """
-        if self._server_socket is None:
-            return
+    def pulse(self, register, callback=None, error_callback=None):
+        self._prepare_action(self.PULSE, callback, error_callback, (self.DIGITAL_WRITE_REGISTERS[register], True))
+        self._prepare_action(self.PULSE, callback, error_callback, (self.DIGITAL_WRITE_REGISTERS[register], False))
 
-        self.defer_write = False
-        if not np.any(self._deferred_writes):
-            return
-        indices_to_write = self.WRITE_INDICES[self._deferred_writes]
-        start_register, stop_index = np.amin(indices_to_write), np.amax(indices_to_write)
-        count = stop_index - start_register + 1
-
-        self.write(start_register, count, callback, error_callback, digital)
-        self._deferred_writes = np.zeros((self.WRITE_REG_COUNT,), dtype=bool)
-
-    def _try_write_register(self, write_index, callback=None, error_callback=None, digital=None):
-        if self._initialized and self._connection_ready:
-            if self._ui.defer_write_checkbox.checkState():
-                self._deferred_writes[write_index] = True
-            else:
-                self.write(write_index, 1, callback, error_callback, digital)
-
-    def _notify_registers(self, original_message, success, cause=None):
-        start_register, count = original_message[1], original_message[2]
-        for i in range(start_register, start_register + count):
-            if success:
-                self._write_registers_by_index[i]._notify_success()
-            else:
-                self._write_registers_by_index[i]._notify_failure(cause)
-
-    @staticmethod
-    def _unpack(raw_data, registers):
-        start_register, register_count = raw_data[:2]
-        register_values = raw_data[2:]
-
-        return {
-            registers[i]: v for i, v in zip(range(start_register, start_register + register_count), register_values)
-        }
-
-    def _update_ui(self, data, original_message):
-        start_register, count = original_message[1], original_message[2]
-        for i, d in zip(range(start_register, start_register + count), data):
-            self._read_registers_by_index[i]._raw_set_value(d, do_write=False)
-
-        self._update_pressure_units()
-        self._update_vacuum_units()
-
-    def _update_pressure_units(self):
-        r = self.registers["pressure"]
-        r._label_units()
-
-        # Adjust the limits on the acceptable pressure range
-        pressure_units = self.registers["pressure_units"].value
-        if self.registers["model_type"].value == "UltimusPlus-NX I":
-            # Is a type I high-pressure dispenser
-            if pressure_units == "psi":
-                low, high = 10, 100
-            elif pressure_units == "bar":
-                low, high = .68, 6.89
-            else:  # pressure_units == "kpa"
-                low, high = 68.9, 689.4
-        else:
-            # Is a type II low-pressure dispenser
-            if pressure_units == "psi":
-                low, high = .3, 15
-            elif pressure_units == "bar":
-                low, high = .02, 1.03
-            else:  # pressure_units == "kpa"
-                low, high = 2.1, 103.4
-        r._edit_box.validator().setRange(low, high, 8)
-        r._text_changed()
-
-    def _update_vacuum_units(self):
-        r = self.registers["vacuum"]
-        r._label_units()
-
-        # Adjust the limits on the acceptable vacuum pressure range
-        pressure_units = self.registers["vacuum_units"].value
-        # Don't care about the dispenser type for this setting
-        if pressure_units == "inches water":
-            low, high = 0, 18
-        elif pressure_units == "inches Hg":
-            low, high = 0, 1.32
-        else:  # pressure_units == "kpa"
-            low, high = 0, 4.4
-        r._edit_box.validator().setRange(low, high, 8)
-        r._text_changed()
+    def get_datetime(self):
+        date = qtc.QDate.currentDate()
+        time = qtc.QTime.currentTime()
+        self.system_date = f"{date.year():04}{date.month():02}{date.day():02}"
+        self.system_time = f"{time.hour():02}{time.minute():02}{time.second():02}"
 
     @property
-    def defer_read(self):
-        return self._ui.defer_read_checkbox.checkState()
-
-    @defer_read.setter
-    def defer_read(self, val):
-        self._ui.defer_read_checkbox.setChecked(val)
-
-    @property
-    def defer_write(self):
-        return self._ui.defer_write_checkbox.checkState()
-
-    @defer_write.setter
-    def defer_write(self, val):
-        self._ui.defer_write_checkbox.setChecked(val)
-        if val:
-            self._ui.do_defer_write_button.setEnabled(True)
-        else:
-            self._ui.do_defer_write_button.setEnabled(False)
-
-    def _clicked_defer_write(self):
-        if self._ui.defer_write_checkbox.checkState():
-            self._ui.do_defer_write_button.setEnabled(True)
-        else:
-            self._ui.do_defer_write_button.setEnabled(False)
-
-    def _set_show_registers(self):
-        if self._ui.show_registers.checkState():
-            self._ui.reg_widget.show()
-        else:
-            self._ui.reg_widget.hide()
-
-    def set_system_time(self):
-        if self._server_socket is None:
-            return
-
-        self.defer_write = True
-        self.date_changed(qtc.QDate.currentDate())
-        self.time_changed(qtc.QTime.currentTime())
-        self.do_deferred_writes()
-
-    def date_changed(self, new_date, do_register_update=True):
-        """
-        Change the date of the dispenser.  new_date must implement month, day, and year as methods, not just
-        attributes.  A qtc.QTDate is the expected input.
-        """
-        if self._server_socket is None:
-            return
-
-        if do_register_update:
-            self.registers["system_date"].value = new_date.month(), new_date.day(), new_date.year()
-        else:
-            self._ui.date_time_picker.blockSignals(True)
-            self._ui.date_time_picker.setDate(new_date)
-            self._ui.date_time_picker.blockSignals(False)
-
-    def time_changed(self, new_time, do_register_update=True):
-        """
-        Change the time of the dispenser.  new_time must implement hour, minute, and second as methods, not just
-        attributes.  A qtc.QTime is the expected input.
-        """
-        if self._server_socket is None:
-            return
-
-        if do_register_update:
-            self.registers["system_time"].value = new_time.hour(), new_time.minute(), new_time.second()
-        else:
-            self._ui.date_time_picker.blockSignals(True)
-            self._ui.date_time_picker.setTime(new_time)
-            self._ui.date_time_picker.blockSignals(False)
-
-    def __getattr__(self, key):
-        return self.registers[key].value
-
-    def __setattr__(self, key, value):
-        if self._initialized and key in self._register_keys:
-            self.registers[key].value = value
-        else:
-            super().__setattr__(key, value)
-
-    def _run_test(self):
-        if self._connection_ready:
-            """register = "trigger"
-            def f(name, value):
-                print(f"test callback called, with name {name} and value {value}")
-
-            self.set_digital(register, "pulse", f)"""
-            # self.dispense_mode = "multishot"
-            pass
-
-    def get_digital(self, name):
-        """
-        Retrieves a digital flag from the read register, but does not issue a read command to the physical dispenser.
-        """
-        return self.registers["digitals"].read(name)
-
-    def read_digital(self, name, callback, error_callback=None):
-        """
-        Issues a read command for a digital to the physical dispenser, and once it is received, fire a callback.  The
-        callback will receive two parameters, the name of the digital, and its value.
-        """
-        self.read(0, 1, callback, error_callback, name)
-
-    def set_digital(self, name, value, callback=None, error_callback=None):
-        """
-        Sets a digital flag in the write register.  This WILL issue a write command to the physical dispenser (unlike
-        get_digital) though this function will respect the state of defer_write - by setting defer_write, multiple
-        write operations can be queued together and send with only a single network operation.
-
-        Many flags make more sense to set with a pulse than setting them to a constant value.  If value is a bool, the
-        flag will be set to that value.  If value is the string "pulse", then the flag will be set high, and once it is
-        acknowledged by the physical dispenser, will automatically set the flag back to low.
-
-        The callback will receive two parameters, the name of the digital, and its value.
-        """
-        if value == "pulse":
-
-            def pulse_callback(name, _, callback=callback):
-                callback(name, True)
-                self.set_digital(name, False)
-
-            self.registers["digitals"].write(name, value, pulse_callback, error_callback)
-        else:
-            print(f"set digital called, with value {value}")
-            self.registers["digitals"].write(name, value, callback, error_callback)
-
-    def check_write_digital(self, name):
-        """
-        Check the state of a write digital.  From the local machine, since this value does not exist on the physical
-        dispenser.
-        """
-        return bool(self.registers["digitals"]._write_value & self.registers["digitals"]._write_bits[name])
-
-    @property
-    def digitals_names(self):
-        """
-        Get the names of the digital register's flags, which are used to set them programmatically.
-        """
-        return {
-            "read-only": tuple(self.registers["digitals"]._read_bits.keys()),
-            "write-only": tuple(self.registers["digitals"]._write_bits.keys())
-        }
-
-    @property
-    def polling_active(self):
+    def poll(self):
         return self._polling_active
 
-    @polling_active.setter
-    def polling_active(self, val):
-        self._polling_active = bool(val)
-        self._try_toggle_polling()
+    @poll.setter
+    def poll(self, val):
+        val = bool(val)
+        if val == self._polling_active:
+            return
 
-    @property
-    def polling_period(self):
-        return self._polling_timer.interval()
-
-    @polling_period.setter
-    def polling_period(self, val):
-        self._polling_timer.setInterval(val * 1000)
-
-    def _try_toggle_polling(self):
-        if self._polling_active and self._connection_ready:
+        self.settings._polling_active = val
+        self._polling_active = val
+        self.poll_changed.emit(val)
+        if self._polling_active:
             self._polling_timer.start()
         else:
             self._polling_timer.stop()
 
-    def _close_update_signals(self):
-        d = self.registers["digitals"]
-        d._write_value &= 0x081f
-        d._write_buttons["update_program_params"].setStyleSheet("QPushButton {background-color: gray}")
-        d._write_buttons["update_program_num"].setStyleSheet("QPushButton {background-color: gray}")
-        d._write_buttons["update_units"].setStyleSheet("QPushButton {background-color: gray}")
+    def _do_poll(self):
+        if self._connection_state == self.CONNECTED:
+            if not self._poll_queued:
+                self._prepare_action(self.POLL, None, None, (0, self.READ_REG_COUNT))
+                self._poll_queued = True
+
+    @property
+    def polling_period(self):
+        return self._polling_timer.interval() / 1000
+
+    @polling_period.setter
+    def polling_period(self, val):
+        v = int(val * 1000)
+        if v != self._polling_timer.interval():
+            self._polling_timer.setInterval(v)
+            self.settings.polling_period = val
+            self.poll_period_changed.emit(val)
+
+    @property
+    def digitals(self):
+        return self.read_registers[0]
+
+    @digitals.setter
+    def digitals(self, val):
+        self.write_registers[0] = val
+        self._prepare_action(self.WRITE, None, None, (0, 1))
+
+    @property
+    def dispensing(self):
+        return bool(self.read_registers[0] & 0x1)
+
+    def trigger_shot(self, callback=None, error_callback=None):
+        self.pulse("trigger", callback, error_callback)
+
+    @property
+    def trigger(self):
+        return bool(self.read_registers[0] & 0x1)
+
+    @trigger.setter
+    def trigger(self, val):
+        mask = self.DIGITAL_WRITE_REGISTERS["trigger"]
+        if val:
+            # turn on
+            self.write_registers[0] |= mask
+        else:
+            # turn off
+            self.write_registers[0] &= ~mask
+        self._prepare_action(self.WRITE, None, None, (0, 1))
+
+    @property
+    def e_stop(self):
+        return bool(self.read_registers[0] & 0x2)
+
+    @e_stop.setter
+    def e_stop(self, val):
+        mask = self.DIGITAL_WRITE_REGISTERS["e_stop"]
+        if val:
+            # turn on
+            self.write_registers[0] |= mask
+        else:
+            # turn off
+            self.write_registers[0] &= ~mask
+        self._prepare_action(self.WRITE, None, None, (0, 1))
+
+    @property
+    def sleep(self):
+        return bool(self.read_registers[0] & 0x4)
+
+    @sleep.setter
+    def sleep(self, val):
+        mask = self.DIGITAL_WRITE_REGISTERS["sleep"]
+        if val:
+            # turn on
+            self.write_registers[0] |= mask
+        else:
+            # turn off
+            self.write_registers[0] &= ~mask
+        self._prepare_action(self.WRITE, None, None, (0, 1))
+
+    @property
+    def log_full(self):
+        return bool(self.read_registers[0] & 0x8)
+
+    def delete_log(self, callback=None, error_callback=None):
+        self.pulse("delete_log", callback, error_callback)
+
+    def update_datetime(self, callback, error_callback):
+        self.pulse("update_datetime", callback, error_callback)
+
+    def update_params(self, callback, error_callback):
+        self.pulse("update_params", callback, error_callback)
+
+    def update_program_num(self, callback, error_callback):
+        self.pulse("update_program_num", callback, error_callback)
+
+    def update_units(self, callback, error_callback):
+        self.pulse("update_units", callback, error_callback)
+
+    @property
+    def model_type(self):
+        v = self.read_registers[1]
+        if v == 1:
+            return "UltimusPlus-NX I"
+        elif v == 2:
+            return "UltimusPlus-NX II"
+        else:
+            return "Unknown Model Type"
+
+    @property
+    def program_num(self):
+        return self.read_registers[2]
+
+    @staticmethod
+    def _format_program_num(val):
+        if 1 <= val <= 16:
+            return val
+        else:
+            raise ValueError(f"Dispenser: program num {val} out of range (1, 16)")
+
+    @program_num.setter
+    def program_num(self, val):
+        if self.write_registers[1] != self._format_program_num(val):
+            self.write_registers[1] = self._format_program_num(val)
+            self._prepare_action(self.WRITE, None, None, (1, 1))
+            self.pulse("update_program_num")
+
+    def set_program_num(self, val, callback, error_callback=None):
+        self.write_registers[1] = self._format_program_num(val)
+        self._prepare_action(self.WRITE, None, error_callback, (1, 1))
+        self.pulse("update_program_num", callback, error_callback)
+
+    @property
+    def dispense_mode(self):
+        v = self.read_registers[3]
+        if v == 1:
+            return "Single Shot"
+        elif v == 2:
+            return "Steady Mode"
+        elif v == 3:
+            return "Teach Mode"
+        elif v == 4:
+            return "MultiShot"
+        else:
+            return "Unknown Dispense Mode"
+
+    @staticmethod
+    def _format_dispense_mode(val):
+        if type(val) is int:
+            if val in {1, 2, 4}:
+                return val
+            else:
+                raise ValueError(f"Dispenser: Invalid value {val} for dispense mode.")
+        else:
+            if val == "Single Shot":
+                return 1
+            elif val == "Steady Mode":
+                return 2
+            elif val == "MultiShot":
+                return 4
+            else:
+                raise ValueError(f"Dispenser: Invalid value {val} for dispense mode.")
+
+    @dispense_mode.setter
+    def dispense_mode(self, val):
+        self.write_registers[2] = self._format_dispense_mode(val)
+        self._prepare_action(self.WRITE, None, None, (2, 1))
+        self.pulse("update_params")
+
+    def set_dispense_mode(self, val, callback, error_callback=None):
+        self.write_registers[2] = self._format_dispense_mode(val)
+        self._prepare_action(self.WRITE, None, error_callback, (2, 1))
+        self.pulse("update_params", callback, error_callback)
+
+    @property
+    def dispense_time(self):
+        return self.read_registers[4] / 10000
+
+    @staticmethod
+    def _format_dispense_time(val):
+        return val * 10000
+
+    @dispense_time.setter
+    def dispense_time(self, val):
+        self.write_registers[3] = self._format_dispense_time(val)
+        self._prepare_action(self.WRITE, None, None, (3, 1))
+        self.pulse("update_params")
+
+    def set_dispense_time(self, val, callback, error_callback=None):
+        self.write_registers[3] = self._format_dispense_time(val)
+        self._prepare_action(self.WRITE, None, error_callback, (3, 1))
+        self.pulse("update_params", callback, error_callback)
+
+    @property
+    def pressure(self):
+        return self.read_registers[5] / 100
+
+    def _format_pressure(self, val):
+        low, high = self.get_pressure_lims()
+        if low <= val <= high:
+            return val * 100
+        else:
+            raise ValueError(f"Dispenser: Pressure {val} out of range for unit: ({low}, {high}) {self.pressure_units}.")
+
+    def get_pressure_lims(self, units=None):
+        if units is None:
+            units = self.pressure_units
+        if self.model_type == "UltimusPlus-NX II":
+            if units == "psi":
+                return .3, 15.0
+            elif units == "bar":
+                return .02, 1.03
+            elif units == "kPa":
+                return 2.1, 103.4
+        else:  # self.model_type == "UltimusPlus-NX I":
+            if units == "psi":
+                return 10.0, 100.0
+            elif units == "bar":
+                return .68, 6.89
+            elif units == "kPa":
+                return 68.9, 689.4
+
+    @pressure.setter
+    def pressure(self, val):
+        self.write_registers[5] = self._format_pressure(val)
+        self._prepare_action(self.WRITE, None, None, (5, 1))
+        self.pulse("update_params")
+
+    def set_pressure(self, val, callback, error_callback=None):
+        self.write_registers[5] = self._format_pressure(val)
+        self._prepare_action(self.WRITE, None, error_callback, (5, 1))
+        self.pulse("update_params", callback, error_callback)
+
+    @property
+    def vacuum(self):
+        return self.read_registers[6] / 100
+
+    def _format_vacuum(self, val):
+        low, high = self.get_vacuum_lims()
+        if low <= val <= high:
+            return val * 100
+        else:
+            raise ValueError(f"Dispenser: Vacuum {val} out of range for unit: ({low}, {high}) {self.vacuum_units}.")
+
+    def get_vacuum_lims(self, units=None):
+        if units is None:
+            units = self.vacuum_units
+        if units == "in water":
+            return 0.0, 18.0
+        elif units == "in Hg":
+            return 0.0, 1.03
+        elif units == "kPa":
+            return 0.0, 4.4
+
+    @vacuum.setter
+    def vacuum(self, val):
+        self.write_registers[7] = self._format_vacuum(val)
+        self._prepare_action(self.WRITE, None, None, (7, 1))
+        self.pulse("update_params")
+
+    def set_vacuum(self, val, callback, error_callback=None):
+        self.write_registers[7] = self._format_vacuum(val)
+        self._prepare_action(self.WRITE, None, error_callback, (7, 1))
+        self.pulse("update_params", callback, error_callback)
+
+    @property
+    def system_count(self):
+        return self.read_registers[7]
+
+    @property
+    def shot_count(self):
+        return self.read_registers[8]
+
+    @property
+    def multishot_count(self):
+        return self.read_registers[9]
+
+    @staticmethod
+    def _format_multishot_count(val):
+        return val
+
+    @multishot_count.setter
+    def multishot_count(self, val):
+        self.write_registers[8] = self._format_multishot_count(val)
+        self._prepare_action(self.WRITE, None, None, (8, 1))
+        self.pulse("update_params")
+
+    def set_multishot_count(self, val, callback, error_callback=None):
+        self.write_registers[8] = self._format_multishot_count(val)
+        self._prepare_action(self.WRITE, None, error_callback, (8, 1))
+        self.pulse("update_params", callback, error_callback)
+
+    @property
+    def multishot_time(self):
+        return self.read_registers[10] / 100
+
+    @staticmethod
+    def _format_multishot_time(val):
+        return val * 100
+
+    @multishot_time.setter
+    def multishot_time(self, val):
+        self.write_registers[9] = self._format_multishot_time(val)
+        self._prepare_action(self.WRITE, None, None, (9, 1))
+        self.pulse("update_params")
+
+    def set_multishot_time(self, val, callback, error_callback=None):
+        self.write_registers[9] = self._format_multishot_time(val)
+        self._prepare_action(self.WRITE, None, error_callback, (9, 1))
+        self.pulse("update_params", callback, error_callback)
+
+    @property
+    def system_date(self):
+        return self.read_registers[11]
+
+    @staticmethod
+    def _format_system_date(val):
+        return val
+
+    @system_date.setter
+    def system_date(self, val):
+        self.write_registers[10] = self._format_system_date(val)
+        self._prepare_action(self.WRITE, None, None, (10, 1))
+        self.pulse("update_datetime")
+
+    def set_system_date(self, val, callback, error_callback=None):
+        self.write_registers[10] = self._format_system_date(val)
+        self._prepare_action(self.WRITE, None, error_callback, (10, 1))
+        self.pulse("update_datetime", callback, error_callback)
+
+    @property
+    def system_time(self):
+        return self.read_registers[12]
+
+    @staticmethod
+    def _format_system_time(val):
+        return val
+
+    @system_time.setter
+    def system_time(self, val):
+        self.write_registers[11] = self._format_system_time(val)
+        self._prepare_action(self.WRITE, None, None, (11, 1))
+        self.pulse("update_datetime")
+
+    def set_system_time(self, val, callback, error_callback=None):
+        self.write_registers[11] = self._format_system_time(val)
+        self._prepare_action(self.WRITE, None, error_callback, (11, 1))
+        self.pulse("update_datetime", callback, error_callback)
+
+    @property
+    def software_version(self):
+        return self.read_registers[13] / 1000
+
+    @property
+    def pressure_units(self):
+        v = self.read_registers[14]
+        if v == 0:
+            return "psi"
+        elif v == 1:
+            return "bar"
+        elif v == 2:
+            return "kPa"
+        else:
+            return "Unknown Unit"
+
+    @staticmethod
+    def _format_pressure_units(val):
+        if type(val) is int:
+            if 0 <= val <= 2:
+                return val
+            else:
+                raise ValueError(f"Dispenser: Invalid value {val} for pressure units.")
+        else:
+            if val == "psi":
+                return 0
+            elif val == "bar":
+                return 1
+            elif val == "kPa":
+                return 2
+            else:
+                raise ValueError(f"Dispenser: Invalid value {val} for pressure units.")
+
+    @pressure_units.setter
+    def pressure_units(self, val):
+        self.write_registers[4] = self._format_pressure_units(val)
+        self._prepare_action(self.WRITE, None, None, (4, 1))
+        self.pulse("update_units")
+
+    def set_pressure_units(self, val, callback, error_callback=None):
+        self.write_registers[4] = self._format_pressure_units(val)
+        self._prepare_action(self.WRITE, None, error_callback, (4, 1))
+        self.pulse("update_units", callback, error_callback)
+        self.read(5, 1)
+
+    @property
+    def vacuum_units(self):
+        v = self.read_registers[15]
+        if v == 0:
+            return "in water"
+        elif v == 1:
+            return "in Hg"
+        elif v == 2:
+            return "kPa"
+        else:
+            return "Unknown Unit"
+
+    @staticmethod
+    def _format_vacuum_units(val):
+        if type(val) is int:
+            if 0 <= val <= 2:
+                return val
+            else:
+                raise ValueError(f"Dispenser: Invalid value {val} for vacuum units.")
+        else:
+            if val == "in water":
+                return 0
+            elif val == "in Hg":
+                return 1
+            elif val == "kPa":
+                return 2
+            else:
+                raise ValueError(f"Dispenser: Invalid value {val} for vacuum units.")
+
+    @vacuum_units.setter
+    def vacuum_units(self, val):
+        self.write_registers[6] = self._format_vacuum_units(val)
+        self._prepare_action(self.WRITE, None, None, (6, 1))
+        self.pulse("update_units")
+
+    def set_vacuum_units(self, val, callback, error_callback=None):
+        self.write_registers[6] = self._format_vacuum_units(val)
+        self._prepare_action(self.WRITE, None, error_callback, (6, 1))
+        self.pulse("update_units", callback, error_callback)
+
+    @property
+    def time_format(self):
+        v = self.read_registers[16]
+        if v == 0:
+            return "AM"
+        elif v == 1:
+            return "PM"
+        elif v == 2:
+            return "24 Hour"
+        else:
+            return "Unknown Time Format"
 
 
 # ======================================================================================================================
 
 
-class DigitalRegister:
-    INDICATOR_SIZE = 20
-    digital_update_register = 0x0000
-    _write_bits = {
-        "trigger": 0x0001,
-        "e_stop": 0x0002,
-        "sleep": 0x0004,
-        "delete_log_1": 0x0008,
-        "set_datetime": 0x0010,
-        "update_program_params": 0x0020,
-        "update_program_num": 0x0040,
-        "update_units": 0x0080,
-        "delete_log_2": 0x0800,
-    }
-    _read_bits = {
-        "running": 0x1,
-        "e_stop_active": 0x2,
-        "sleeping": 0x4,
-        "log_full": 0x8
-    }
+class DispenserConnectionWidget(qtw.QWidget):
+    def __init__(self, dispenser, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dispenser = dispenser
+        self.dispenser.connection_event.connect(self._connection_changed)
 
-    def __init__(self, master_widget, name, read_index, write_index):
-        self._name = name
-        self._read_index = read_index
-        self._write_index = write_index
-        self._master_widget = master_widget
-        self._read_value = 0x0
-        self._write_value = 0x0
-
-        self._read_indicators = {}
-        self._write_buttons = {}
-
-        self.write_successful = RegisterWriteSuccess()
-        self.write_failed = RegisterWriteFailure()
-
-        # Signals for when the read bits change state
-        self.running_low = FlagLow()
-        self.running_high = FlagHigh()
-        self.running_changed = FlagChanged()
-
-        self.e_stop_active_low = FlagLow()
-        self.e_stop_active_high = FlagHigh()
-        self.e_stop_active_changed = FlagChanged()
-
-        self.sleeping_low = FlagLow()
-        self.sleeping_high = FlagHigh()
-        self.sleeping_changed = FlagChanged()
-
-        self.log_full_low = FlagLow()
-        self.log_full_high = FlagHigh()
-        self.log_full_changed = FlagChanged()
-
-    def make_widget(self):
-        widget = qtw.QWidget()
         layout = qtw.QGridLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        widget.setLayout(layout)
+        self.setLayout(layout)
+        ui_row = 0
 
-        read_row = 1
-        layout.addWidget(qtw.QLabel("Read Bits"), 0, 3, 1, 2)
-        for name, mask in self._read_bits.items():
-            layout.addWidget(qtw.QLabel(name.replace('_', ' ').title()), read_row, 3, 1, 1)
-            indicator = qtw.QWidget()
-            indicator.setStyleSheet("background-color: gray;")
-            indicator.setMinimumWidth(self.INDICATOR_SIZE)
-            indicator.setMaximumWidth(self.INDICATOR_SIZE)
-            indicator.setMaximumHeight(self.INDICATOR_SIZE)
-            indicator.setMinimumHeight(self.INDICATOR_SIZE)
-            indicator.setAutoFillBackground(True)
-            layout.addWidget(indicator, read_row, 4, 1, 1)
-            self._read_indicators[name] = indicator
-            read_row += 1
-
-        write_row = 1
-        layout.addWidget(qtw.QLabel("Write Bits"), 0, 0, 1, 2)
-        for name, mask in self._write_bits.items():
-            layout.addWidget(qtw.QLabel(name.replace('_', ' ').title()), write_row, 0, 1, 1)
-            button = qtw.QPushButton("")
-            button.setStyleSheet("QPushButton {background-color: gray}")
-            button.setMinimumWidth(self.INDICATOR_SIZE)
-            button.setMaximumWidth(self.INDICATOR_SIZE)
-            button.setMaximumHeight(self.INDICATOR_SIZE)
-            layout.addWidget(button, write_row, 1, 1, 1)
-            self._write_buttons[name] = button
-            write_row += 1
-
-        # Hook callbacks up to each write button
-        for name, mask in self._write_bits.items():
-            def func(_, mask=mask, name=name):
-                new_state = not bool(self._write_value & mask)
-                if new_state:
-                    self._write_value |= mask
-                    self._write_buttons[name].setStyleSheet("QPushButton {background-color: green}")
-                else:
-                    self._write_value &= ~mask
-                    self._write_buttons[name].setStyleSheet("QPushButton {background-color: gray}")
-                self._master_widget._try_write_register(self._write_index)
-            self._write_buttons[name].clicked.connect(func)
-
-        max_rows = max(write_row, read_row)
-        separator = qtw.QFrame()
-        separator.setFrameShape(qtw.QFrame.VLine)
-        separator.setFrameShadow(qtw.QFrame.Sunken)
-        layout.addWidget(separator, 0, 2, max_rows, 1)
-
-        return widget
-
-    def _raw_set_value(self, val, do_write=False):
-        """
-        Called in _update_ui, this should set the read values.  We will never need to use the do_write argument,
-        since the input and output interface are different for this register, and we will never have to worry about
-        the infinite loop issue of updates to the UI causing updates to the value causing updates to the UI again.
-
-        Unlike other registers, we do not want to send a write command from this function, because this class
-        does not internally use this function - it is here just for compatibility.
-        """
-        changed_flags = self._read_value ^ val
-
-        self._read_value = val
-        for name, mask in self._read_bits.items():
-            if self._read_value & mask:
-                self._read_indicators[name].setStyleSheet("background-color: green;")
-            else:
-                self._read_indicators[name].setStyleSheet("background-color: gray;")
-
-        # Fire off all the events when flags change
-        mask = self._read_bits["running"]
-
-        if changed_flags & mask:
-            is_on = self._read_value & mask
-            self.running_changed.emit(is_on)
-            if is_on:
-                self.running_high.emit()
-            else:
-                self.running_low.emit()
-
-        mask = self._read_bits["e_stop_active"]
-        if changed_flags & mask:
-            is_on = self._read_value & mask
-            self.e_stop_active_changed.emit(is_on)
-            if is_on:
-                self.e_stop_active_high.emit()
-            else:
-                self.e_stop_active_low.emit()
-
-        mask = self._read_bits["sleeping"]
-        if changed_flags & mask:
-            is_on = self._read_value & mask
-            self.sleeping_changed.emit(is_on)
-            if is_on:
-                self.sleeping_high.emit()
-            else:
-                self.sleeping_low.emit()
-
-        mask = self._read_bits["log_full"]
-        if changed_flags & mask:
-            is_on = self._read_value & mask
-            self.log_full_changed.emit(is_on)
-            if is_on:
-                self.log_full_high.emit()
-            else:
-                self.log_full_low.emit()
-
-    def to_bytes(self):
-        return f"{self._write_value}".encode("utf-8")
-
-    def _notify_success(self):
-        self.write_successful.emit(self._name)
-
-    def _notify_failure(self, cause):
-        self.write_failed.emit((self._name, cause))
-
-    def set_enabled(self, state):
-        for button in self._write_buttons.values():
-            button.setEnabled(state)
-
-    def read(self, name):
-        return bool(self._read_value & self._read_bits[name])
-
-    def check_write_value(self, name):
-        return bool(self._write_value & self._write_bits[name])
-
-    def write(self, name, value, callback=None, error_callback=None):
-        if value:
-            self._write_value |= self._write_bits[name]
-            self._write_buttons[name].setStyleSheet("QPushButton {background-color: green}")
-        else:
-            self._write_value &= ~self._write_bits[name]
-            self._write_buttons[name].setStyleSheet("QPushButton {background-color: gray}")
-        self._master_widget._try_write_register(self._write_index, callback, error_callback, name)
-
-
-class Register:
-    """
-    The value stored in _value is always an int, and always formatted to exactly match what the dispenser
-    expects.  i.e. it is scaled appropriately.
-
-    The setter/getter for the attribute value uses parse/format to convert the raw _value into a more
-    user friendly format.
-
-    The _raw_set_value's job is to update the UI element and send a write command to the dispenser, if applicable.
-    """
-    def __init__(
-        self, master_widget, name, min, max, dtype, read_index, write_index=None, scale=1, unit_type=None,
-        digital_update_register=0x0000
-    ):
-        self._name = name
-        self._read_index = read_index
-        self._write_index = write_index
-        self._scale = scale
-        self._value = 0
-        self._unit_type = unit_type
-        self._master_widget = master_widget
-        self.digital_update_register = digital_update_register
-        if dtype in {int, float}:
-            self._dtype = dtype
-        else:
-            raise ValueError(f"Register {name}: dtype must be int or float.")
-        self._validator = self._get_validator(min, max)
-        self._label_base = self._name.replace('_', ' ').title()
-        self._label = qtw.QLabel(self._label_base)
-        self._edit_box = None
-
-        self.write_successful = RegisterWriteSuccess()
-        self.write_failed = RegisterWriteFailure()
-
-    def format(self, value):
-        return self._dtype(value / self._scale)
-
-    def parse(self, value):
-        if self._dtype is int:
-            return int(value) * self._scale
-        else:
-            return round(float(value) * self._scale)
-
-    def make_widget(self):
-        widget = qtw.QWidget()
-        layout = qtw.QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        widget.setLayout(layout)
-
-        layout.addWidget(self._label)
-        # If the unit type is a string, might as well update it once now.  Will never need to be updated again
-        if type(self._unit_type) is str:
-            self._label_units()
-        if self._write_index is None:
-            self._edit_box = qtw.QLabel("")
-        else:
-            self._edit_box = qtw.QLineEdit("")
-            if self._validator is not None:
-                self._edit_box.setValidator(self._validator)
-            self._edit_box.editingFinished.connect(self._editing_finished)
-            self._edit_box.textChanged.connect(self._text_changed)
-        layout.addWidget(self._edit_box)
-        layout.addStretch()
-
-        return widget
-
-    def _get_validator(self, min, max):
-        if self._dtype is int:
-            return qtg.QIntValidator(min, max)
-        else:  # dtype is float
-            return qtg.QDoubleValidator(min, max, 8)
-
-    @property
-    def writable(self):
-        return self._write_index is None
-
-    def _raw_set_value(self, val, do_write=True):
-        self._value = val
-        if self._edit_box is not None and not self._edit_box.hasFocus():
-            self._edit_box.setText(str(self.format(val)))
-        if do_write and self._write_index is not None:
-            self._master_widget._try_write_register(self._write_index)
-
-    def _label_units(self):
-        if self._unit_type is None:
-            return
-        if type(self._unit_type) is str:
-            units = self._unit_type
-        else:
-            units = self._master_widget.registers[Dispenser.READ_REGISTERS[self._unit_type]].value
-        self._label.setText(self._label_base + f" ({units})")
-
-    def _editing_finished(self):
-        self.value = self._edit_box.text()
-
-    def _text_changed(self):
-        if self._validator is None:
-            return
-        if self._validator.validate(self._edit_box.text(), 0)[0] == qtg.QValidator.Acceptable:
-            self._edit_box.setStyleSheet("QLineEdit { background-color: white}")
-        else:
-            self._edit_box.setStyleSheet("QLineEdit { background-color: pink}")
-
-    @property
-    def value(self):
-        return self.format(self._value)
-
-    @value.setter
-    def value(self, val):
-        if self._edit_box is not None and self._validator is not None:
-            if self._validator.validate(str(val), 0)[0] != qtg.QValidator.Acceptable:
-                raise ValueError(f"Register {self._name} value {val} is out of bounds.")
-
-        val = self.parse(val)
-        if self._write_index is None:
-            raise AttributeError(f"Register {self._name} cannot be written to.")
-        else:
-            self._raw_set_value(val)
-
-    def to_bytes(self):
-        return f"{self._value}".encode("utf-8")
-
-    def _notify_success(self):
-        self.write_successful.emit(self._name)
-
-    def _notify_failure(self, cause):
-        self.write_failed.emit((self._name, cause))
-
-
-class ModelTypeRegister(Register):
-    @staticmethod
-    def format(value):
-        if value == 1:
-            return "UltimusPlus-NX I"
-        else:
-            return "UltimusPlus-NX II"
-
-
-class TimeFormatRegister(Register):
-    @staticmethod
-    def format(value):
-        if value == 0:
-            return "AM"
-        elif value == 1:
-            return "PM"
-        else:
-            return "24HR"
-
-
-class DateRegister(Register):
-    def make_widget(self):
-        return None
-
-    def parse(self, value):
-        month, day, year = value
-        return int(f"{year}{month:02d}{day:02d}")
-
-    def format(self, value):
-        s = f"{value:08d}"
-        return int(s[:4]), int(s[4:6]), int(s[6:])  # year, month, day, as ints
-
-    def _raw_set_value(self, val, do_write=True):
-        self._value = val
-        self._master_widget.date_changed(qtc.QDate(*self.format(val)), do_register_update=False)
-        if do_write:
-            self._master_widget._try_write_register(self._write_index)
-
-    def to_bytes(self):
-        return f"{self._value:08d}".encode("utf-8")
-
-
-class TimeRegister(Register):
-    def make_widget(self):
-        return None
-
-    def parse(self, value):
-        hour, minute, second = value
-        return int(f"{hour:02d}{minute:02d}{second:02d}")
-
-    def format(self, value):
-        s = f"{value:06d}"
-        return int(s[:2]), int(s[2:4]), int(s[4:])
-
-    def _raw_set_value(self, val, do_write=True):
-        self._value = val
-        self._master_widget.time_changed(qtc.QTime(*self.format(val)), do_register_update=False)
-        if do_write:
-            self._master_widget._try_write_register(self._write_index)
-
-    def to_bytes(self):
-        return f"{self._value:06d}".encode("utf-8")
-
-
-class SelectableRegister(Register):
-    def __init__(
-        self, master_widget, name, choices, read_index, write_index, scale=1, selection_callback=None,
-        digital_update_register=0x0000
-    ):
-        self._choices = choices
-        self._selector = None
-        self._parser = {v: k for k, v in choices.items()}
-        self._selection_callback = selection_callback
-        keys = np.array(tuple(choices.keys()), dtype=np.int32)
-        min_key, max_key = np.amin(keys), np.amax(keys)
-        super().__init__(
-            master_widget, name, min_key, max_key, int, read_index, write_index=write_index, scale=scale,
-            digital_update_register=digital_update_register
+        # IP controls
+        self._ip_entry = sw.SettingsEntryBox(
+            self.dispenser.settings, "dispenser_ip", str, validator=IP4Validator(), label="Dispenser IP"
         )
+        self._ip_entry.edit_box.textChanged.connect(self._ip_changed)
+        layout.addWidget(self._ip_entry, ui_row, 0, 1, 12)
+        ui_row += 1
 
-    def format(self, value):
-        return self._choices[value]
+        self._port_entry = sw.SettingsEntryBox(
+            self.dispenser.settings, "dispenser_port", int, validator=qtg.QIntValidator(0, 65535),
+            label="Dispenser Port"
+        )
+        layout.addWidget(self._port_entry, ui_row, 0, 1, 12)
+        ui_row += 1
 
-    def parse(self, value):
-        try:
-            return self._parser[value]
-        except KeyError as e:
-            raise ValueError(f"SelectableRegister: {value} is not valid for this register") from e
+        self._connect_button = qtw.QPushButton("Connect")
+        self._connect_button.clicked.connect(self._click_connect)
+        layout.addWidget(self._connect_button, ui_row, 0, 1, 4)
 
-    def make_widget(self):
-        widget = qtw.QWidget()
+        self._connection_indicator = Indicator("gray")
+        layout.addWidget(self._connection_indicator, ui_row, 5, 1, 1)
+
+    def _connection_changed(self, state):
+        if state == Dispenser.CONNECTED:
+            self._connect_button.setText("Disconnect.")
+            self._connection_indicator.set_color("green")
+        elif state == Dispenser.CONNECTING:
+            self._connect_button.setText("Connecting...")
+            self._connection_indicator.set_color("yellow")
+        elif state == Dispenser.DISCONNECTED:
+            self._connect_button.setText("Connect")
+            self._connection_indicator.set_color("gray")
+        elif state == Dispenser.CONNECTION_ERROR:
+            self._connect_button.setText("Connect")
+            self._connection_indicator.set_color("red")
+
+    def _click_connect(self):
+        if self.dispenser.connection_state == Dispenser.DISCONNECTED:
+            self.dispenser.connect()
+        else:
+            self.dispenser.disconnect()
+
+    def _ip_changed(self):
+        state = self._ip_entry.edit_box.validator().validate(self._ip_entry.edit_box.text(), 0)[0]
+        if state == qtg.QValidator.Acceptable:
+            color = "white"
+        else:
+            color = "pink"
+        self._ip_entry.setStyleSheet("QLineEdit { background-color: %s }" % color)
+
+
+class DispenserPollingWidget(qtw.QWidget):
+    def __init__(self, dispenser, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dispenser = dispenser
+        self.dispenser.poll_changed.connect(self._poll_remotely_changed)
+        self.dispenser.poll_period_changed.connect(self._poll_period_remotely_changed)
+        self.dispenser.connection_event.connect(self._respond_to_connection_event)
+
         layout = qtw.QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        widget.setLayout(layout)
+        self.setLayout(layout)
 
-        layout.addWidget(qtw.QLabel(self._name.replace('_', ' ').title()))
-        self._selector = qtw.QComboBox()
-        self._selector.addItems(self._choices.values())
-        self._selector.currentTextChanged.connect(self._selection_changed)
-        if self._selection_callback is not None:
-            self._selector.currentTextChanged.connect(self._selection_callback)
-        layout.addWidget(self._selector)
-        layout.addWidget(self._selector)
+        self.poll_active_entry = sw.SettingsCheckBox(
+            self.dispenser.settings, "polling_active", "Automatic Polling", callback=self._poll_clicked
+        )
+        layout.addWidget(self.poll_active_entry)
+
+        self.poll_period_entry = sw.SettingsEntryBox(
+            self.dispenser.settings, "polling_period", float, qtg.QDoubleValidator(1e-2, 1e3, 3),
+            callback=self._period_changed
+        )
+        layout.addWidget(self.poll_period_entry)
+
+        read_button = qtw.QPushButton("Read Now")
+        read_button.clicked.connect(self._read)
+        layout.addWidget(read_button)
+
+        self._respond_to_connection_event(dispenser.connection_state)
+
+    def _poll_clicked(self, val):
+        self.dispenser.poll = val
+
+    def _poll_remotely_changed(self, val):
+        self.poll_active_entry.set_value(val)
+
+    def _respond_to_connection_event(self, state):
+        if state == Dispenser.CONNECTED:
+            self.show()
+        else:
+            self.hide()
+
+    def _period_changed(self):
+        self.dispenser.polling_period = self.dispenser.settings.polling_period
+
+    def _poll_period_remotely_changed(self, val):
+        self.poll_period_entry.set_value(val)
+
+    def _read(self):
+        self.dispenser.read()
+
+
+class ReadOnlyWidget(qtw.QWidget):
+    def __init__(self, dispenser, name, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dispenser = dispenser
+        self.dispenser.connection_event.connect(self._respond_to_connection_event)
+
+        layout = qtw.QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+
+        layout.addWidget(qtw.QLabel(name.replace("_", " ").title()))
+        self._label = qtw.QLabel("")
+        layout.addWidget(self._label)
+        changed_signal = getattr(self.dispenser, name + "_changed")
+        changed_signal.connect(lambda x: self._label.setText(str(x)))
+
+    def _respond_to_connection_event(self, state):
+        if state == Dispenser.CONNECTED:
+            self.show()
+        else:
+            self.hide()
+
+
+class DateTimeWidget(qtw.QDateTimeEdit):
+    def __init__(self, dispenser, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dispenser = dispenser
+        self.dispenser.connection_event.connect(self._respond_to_connection_event)
+
+        self.setCalendarPopup(True)
+        self.setMinimumDate(qtc.QDate(1901, 12, 13))
+        self.setMaximumDate(qtc.QDate(2038, 1, 19))
+        self.dateChanged.connect(self._date_changed)
+        self.timeChanged.connect(self._time_changed)
+
+        self.dispenser.system_date_changed.connect(self._update_date)
+        self.dispenser.system_time_changed.connect(self._update_time)
+
+    def _date_changed(self):
+        date = self.date()
+        self.dispenser.system_date = 10000 * date.year() + 100 * date.month() + date.day()
+
+    def _time_changed(self):
+        time = self.time()
+        self.dispenser.system_time = 10000 * time.hour() + 100 * time.minute() + time.second()
+
+    def _update_date(self, val):
+        d = val
+        day = d % 100
+        d = d // 100
+        month = d % 100
+        d = d // 100
+        year = d
+        self.blockSignals(True)
+        self.setDate(qtc.QDate(year, month, day))
+        self.blockSignals(False)
+
+    def _update_time(self, val):
+        t = val
+        second = t % 100
+        t = t // 100
+        minute = t % 100
+        t = t // 100
+        hour = t
+        self.blockSignals(True)
+        self.setTime(qtc.QTime(hour, minute, second))
+        self.blockSignals(False)
+
+    def _respond_to_connection_event(self, state):
+        if state == Dispenser.CONNECTED:
+            self.show()
+        else:
+            self.hide()
+
+
+class ParamsWidget(qtw.QWidget):
+    def __init__(self, dispenser, *args, **kwargs):
+        # TODO there is some wierd, rare crosstalk between the pressure / vacuum units and the vacuum / pressure.
+        # I can't figure it out though, and it is minor enough that I am going to ignore for now and move on.
+        super().__init__(*args, **kwargs)
+        self.dispenser = dispenser
+        self.dispenser.connection_event.connect(self._respond_to_connection_event)
+        self._old_pressure_units = None
+        self._old_vacuum_units = None
+
+        layout = qtw.QGridLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+        ui_row = 0
+
+        self._program_num_label = qtw.QLabel("Program number")
+        layout.addWidget(self._program_num_label, ui_row, 0, 1, 1)
+        self._program_num = qtw.QLineEdit("1")
+        self._program_num.setValidator(qtg.QIntValidator(1, 16))
+        self._program_num.editingFinished.connect(self._program_num_changed)
+        self.dispenser.program_num_changed.connect(self._update_program_num)
+        layout.addWidget(self._program_num, ui_row, 1, 1, 3)
+        ui_row += 1
+
+        self._dispense_mode_label = qtw.QLabel("Dispense mode")
+        layout.addWidget(self._dispense_mode_label, ui_row, 0, 1, 1)
+        self._dispense_mode = qtw.QComboBox()
+        self._dispense_mode.addItems(("Single Shot", "Steady Mode", "MultiShot"))
+        self._dispense_mode.currentTextChanged.connect(self._dispense_mode_changed)
+        self.dispenser.dispense_mode_changed.connect(self._update_dispense_mode)
+        layout.addWidget(self._dispense_mode, ui_row, 1, 1, 3)
+        ui_row += 1
+
+        self._dispense_time_label = qtw.QLabel("Dispense time")
+        layout.addWidget(self._dispense_time_label, ui_row, 0, 1, 1)
+        self._dispense_time = qtw.QLineEdit("")
+        self._dispense_time.setValidator(qtg.QDoubleValidator(.0001, 9999.0, 4))
+        self._dispense_time.editingFinished.connect(self._dispense_time_changed)
+        self.dispenser.dispense_time_changed.connect(self._update_dispense_time)
+        layout.addWidget(self._dispense_time, ui_row, 1, 1, 3)
+        ui_row += 1
+
+        self._pressure_label = qtw.QLabel("Pressure")
+        layout.addWidget(self._pressure_label, ui_row, 0, 1, 1)
+        self._pressure = qtw.QLineEdit("")
+        self._pressure.setValidator(qtg.QDoubleValidator(0, 10000, 2))
+        self._pressure.editingFinished.connect(self._pressure_changed)
+        self.dispenser.pressure_changed.connect(self._update_pressure)
+        layout.addWidget(self._pressure, ui_row, 1, 1, 2)
+
+        self._pressure_units = qtw.QComboBox()
+        self._pressure_units.addItems(("psi", "bar", "kPa"))
+        self._pressure_units.currentTextChanged.connect(self._pressure_units_changed)
+        self.dispenser.pressure_units_changed.connect(self._update_pressure_units)
+        layout.addWidget(self._pressure_units, ui_row, 3, 1, 1)
+        ui_row += 1
+
+        self._vacuum_label = qtw.QLabel("Vacuum")
+        layout.addWidget(self._vacuum_label, ui_row, 0, 1, 1)
+        self._vacuum = qtw.QLineEdit("")
+        self._vacuum.setValidator(qtg.QDoubleValidator(0, 10000, 2))
+        self._vacuum.editingFinished.connect(self._vacuum_changed)
+        self.dispenser.vacuum_changed.connect(self._update_vacuum)
+        layout.addWidget(self._vacuum, ui_row, 1, 1, 2)
+
+        self._vacuum_units = qtw.QComboBox()
+        self._vacuum_units.addItems(("in water", "in Hg", "kPa"))
+        self._vacuum_units.currentTextChanged.connect(self._vacuum_units_changed)
+        self.dispenser.vacuum_units_changed.connect(self._update_vacuum_units)
+        layout.addWidget(self._vacuum_units, ui_row, 3, 1, 1)
+        ui_row += 1
+        
+        self._multishot_count_label = qtw.QLabel("MultiShot Count")
+        layout.addWidget(self._multishot_count_label, ui_row, 0, 1, 1)
+        self._multishot_count = qtw.QLineEdit("")
+        self._multishot_count.setValidator(qtg.QIntValidator(0, 9999))
+        self._multishot_count.editingFinished.connect(self._multishot_count_changed)
+        self.dispenser.multishot_count_changed.connect(self._update_multishot_count)
+        layout.addWidget(self._multishot_count, ui_row, 1, 1, 3)
+        ui_row += 1
+
+        self._multishot_time_label = qtw.QLabel("MultiShot Time")
+        layout.addWidget(self._multishot_time_label, ui_row, 0, 1, 1)
+        self._multishot_time = qtw.QLineEdit("")
+        self._multishot_time.setValidator(qtg.QDoubleValidator(0.1, 999.9, 1))
+        self._multishot_time.editingFinished.connect(self._multishot_time_changed)
+        self.dispenser.multishot_time_changed.connect(self._update_multishot_time)
+        layout.addWidget(self._multishot_time, ui_row, 1, 1, 3)
+        ui_row += 1
+
+    def _program_num_changed(self):
+        self.dispenser.program_num = int(self._program_num.text())
+
+    def _update_program_num(self, val):
+        self._program_num.blockSignals(True)
+        self._program_num.setText(str(val))
+        self._program_num.blockSignals(False)
+
+    def _dispense_mode_changed(self, new_mode):
+        self.dispenser.dispense_mode = new_mode
+        self._dispense_mode_changed_side_effects(new_mode)
+
+    def _dispense_mode_changed_side_effects(self, new_mode):
+        if new_mode == "Steady Mode":
+            self._dispense_time.hide()
+            self._dispense_time_label.hide()
+            self._multishot_count_label.hide()
+            self._multishot_count.hide()
+            self._multishot_time_label.hide()
+            self._multishot_time.hide()
+        elif new_mode == "Single Shot":
+            self._dispense_time.show()
+            self._dispense_time_label.show()
+            self._multishot_count_label.hide()
+            self._multishot_count.hide()
+            self._multishot_time_label.hide()
+            self._multishot_time.hide()
+        else:  # new_mode == "Single Shot"
+            self._dispense_time.show()
+            self._dispense_time_label.show()
+            self._multishot_count_label.show()
+            self._multishot_count.show()
+            self._multishot_time_label.show()
+            self._multishot_time.show()
+
+    def _respond_to_connection_event(self, state):
+        if state == Dispenser.CONNECTED:
+            self.show()
+        else:
+            self.hide()
+
+    def _update_dispense_mode(self, val):
+        self._dispense_mode.blockSignals(True)
+        self._dispense_mode.setCurrentText(val)
+        self._dispense_mode.blockSignals(False)
+        self._dispense_mode_changed_side_effects(val)
+
+    def _dispense_time_changed(self):
+        self.dispenser.dispense_time = float(self._dispense_time.text())
+
+    def _update_dispense_time(self, val):
+        self._dispense_time.blockSignals(True)
+        self._dispense_time.setText(str(val))
+        self._dispense_time.blockSignals(False)
+
+    def _pressure_units_changed(self, new_units):
+        self.dispenser.pressure_units = new_units
+        self._pressure_units_changed_side_effects(new_units)
+
+    def _pressure_units_changed_side_effects(self, new_units):
+        if self._old_pressure_units is None:
+            self._old_pressure_units = new_units
+        low, high = self.dispenser.get_pressure_lims(new_units)
+        self._pressure.validator().setRange(low, high, 2)
+        # Let the dispenser perform the unit conversion, which can be accomplished by just calling read.  This will
+        # also ensure that the limits get updated correctly.
+        self.dispenser.read()
+
+    def _update_pressure_units(self, val):
+        self._pressure_units.blockSignals(True)
+        self._pressure_units.setCurrentText(val)
+        self._pressure_units.blockSignals(False)
+        self._pressure_units_changed_side_effects(val)
+
+    def _pressure_changed(self):
+        self.dispenser.pressure = float(self._pressure.text())
+
+    def _update_pressure(self, val):
+        self._pressure.blockSignals(True)
+        self._pressure.setText(str(val))
+        self._pressure.blockSignals(False)
+
+    def _vacuum_units_changed(self, new_units):
+        self.dispenser.vacuum_units = new_units
+        self._vacuum_units_changed_side_effects(new_units)
+
+    def _vacuum_units_changed_side_effects(self, new_units):
+        if self._old_vacuum_units is None:
+            self._old_vacuum_units = new_units
+        low, high = self.dispenser.get_vacuum_lims(new_units)
+        self._vacuum.validator().setRange(low, high, 2)
+        # Let the dispenser perform the unit conversion, which can be accomplished by just calling read.  This will
+        # also ensure that the limits get updated correctly.
+        self.dispenser.read()
+
+    def _update_vacuum_units(self, val):
+        self._vacuum_units.blockSignals(True)
+        self._vacuum_units.setCurrentText(val)
+        self._vacuum_units.blockSignals(False)
+        self._vacuum_units_changed_side_effects(val)
+
+    def _vacuum_changed(self):
+        self.dispenser.vacuum = float(self._vacuum.text())
+
+    def _update_vacuum(self, val):
+        self._vacuum.blockSignals(True)
+        self._vacuum.setText(str(val))
+        self._vacuum.blockSignals(False)
+
+    def _multishot_count_changed(self):
+        self.dispenser.multishot_count = int(self._multishot_count.text())
+
+    def _update_multishot_count(self, val):
+        self._multishot_count.blockSignals(True)
+        self._multishot_count.setText(str(val))
+        self._multishot_count.blockSignals(False)
+
+    def _multishot_time_changed(self):
+        self.dispenser.multishot_time = int(self._multishot_time.text())
+
+    def _update_multishot_time(self, val):
+        self._multishot_time.blockSignals(True)
+        self._multishot_time.setText(str(val))
+        self._multishot_time.blockSignals(False)
+
+
+class DigitalsWidget(qtw.QWidget):
+    def __init__(self, dispenser, show_log=False, horizontal=True, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dispenser = dispenser
+        self.dispenser.connection_event.connect(self._respond_to_connection_event)
+
+        if horizontal:
+            layout = qtw.QHBoxLayout()
+        else:
+            layout = qtw.QVBoxLayout()
+        self.setLayout(layout)
+
+        self._sleep_button = qtw.QCheckBox("Sleep")
+        self._sleep_button.setTristate(False)
+        self._sleep_button.clicked.connect(self._toggle_sleep)
+        self.dispenser.sleeping_changed.connect(self._update_sleeping)
+        layout.addWidget(self._sleep_button)
+
+        self._e_stop_button = qtw.QCheckBox("E Stop")
+        self._e_stop_button.setTristate(False)
+        self._e_stop_button.clicked.connect(self._toggle_e_stop)
+        self.dispenser.e_stop_active_changed.connect(self._update_e_stop)
+        layout.addWidget(self._e_stop_button)
+
+        self._clear_log = qtw.QPushButton("Delete Log")
+        self._clear_log.clicked.connect(lambda x: self.dispenser.delete_log())
+        layout.addWidget(self._clear_log)
+
+        if horizontal:
+            layout.addStretch()
+
+        self.show_log = show_log
+
+    def _toggle_sleep(self):
+        self.dispenser.sleep = not self.dispenser.sleep
+
+    def _update_sleeping(self, val):
+        self._sleep_button.blockSignals(True)
+        if val:
+            s = 2
+        else:
+            s = 0
+        self._sleep_button.setCheckState(s)
+        self._sleep_button.blockSignals(False)
+
+    def _toggle_e_stop(self):
+        self.dispenser.e_stop = not self.dispenser.e_stop
+
+    def _update_e_stop(self, val):
+        self._e_stop_button.blockSignals(True)
+        if val:
+            s = 2
+        else:
+            s = 0
+        self._e_stop_button.setCheckState(s)
+        self._e_stop_button.blockSignals(False)
+
+    def _respond_to_connection_event(self, state):
+        if state == Dispenser.CONNECTED:
+            self.show()
+        else:
+            self.hide()
+
+    @property
+    def show_log(self):
+        return self._show_log
+
+    @show_log.setter
+    def show_log(self, val):
+        self._show_log = val
+        if val:
+            self._clear_log.show()
+        else:
+            self._clear_log.hide()
+
+
+class TriggerWidget(qtw.QWidget):
+    def __init__(self, dispenser, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dispenser = dispenser
+        self.dispenser.connection_event.connect(self._respond_to_connection_event)
+        self.dispenser.dispense_mode_changed.connect(self._respond_to_mode_change)
+
+        layout = qtw.QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+
+        self._trigger_shot_button = qtw.QPushButton("Trigger Shot")
+        self._trigger_shot_button.clicked.connect(lambda x: self.dispenser.trigger_shot())
+        layout.addWidget(self._trigger_shot_button)
+
+        self._trigger_steady_button = qtw.QPushButton("Trigger Start")
+        self._trigger_steady_button.clicked.connect(self._trigger_steady)
+        layout.addWidget(self._trigger_steady_button)
+
+        self._status = Indicator("gray")
+        self.dispenser.dispensing_changed.connect(self._set_status)
+        layout.addWidget(self._status)
+
         layout.addStretch()
 
-        return widget
+    def _set_status(self, state):
+        if state:
+            self._status.set_color("blue")
+            self._trigger_steady_button.setText("Trigger Stop")
+        else:
+            self._status.set_color("gray")
+            self._trigger_steady_button.setText("Trigger Start")
 
-    def _selection_changed(self, text):
-        self.value = text
+    def _trigger_steady(self):
+        self.dispenser.trigger = not self.dispenser.trigger
 
-    def _raw_set_value(self, val, do_write=True):
-        self._value = val
-        if self._selector is not None:
-            self._selector.setCurrentText(self.format(val))
-        if do_write and self._write_index is not None:
-            self._master_widget._try_write_register(self._write_index)
+    def _respond_to_connection_event(self, state):
+        if state == Dispenser.CONNECTED:
+            self.show()
+        else:
+            self.hide()
 
-
-class RegisterWriteSuccess(qtc.QObject):
-    sig = qtc.pyqtSignal(str)
-
-    def connect(self, value):
-        self.sig.connect(value)
-
-    def emit(self, *args):
-        self.sig.emit(*args)
-
-
-class RegisterWriteFailure(qtc.QObject):
-    sig = qtc.pyqtSignal(tuple)
-
-    def connect(self, value):
-        self.sig.connect(value)
-
-    def emit(self, *args):
-        self.sig.emit(*args)
+    def _respond_to_mode_change(self, new_mode):
+        if new_mode == "Steady Mode":
+            self._trigger_shot_button.hide()
+            self._trigger_steady_button.show()
+        else:
+            self._trigger_shot_button.show()
+            self._trigger_steady_button.hide()
 
 
-class FlagLow(qtc.QObject):
-    sig = qtc.pyqtSignal()
-
-    def connect(self, value):
-        self.sig.connect(value)
-
-    def emit(self, *args):
-        self.sig.emit(*args)
-
-
-class FlagHigh(qtc.QObject):
-    sig = qtc.pyqtSignal()
-
-    def connect(self, value):
-        self.sig.connect(value)
-
-    def emit(self, *args):
-        self.sig.emit(*args)
+# ======================================================================================================================
 
 
 class FlagChanged(qtc.QObject):
@@ -1253,7 +1666,37 @@ class FlagChanged(qtc.QObject):
 
 
 class ConnectionChanged(qtc.QObject):
-    sig = qtc.pyqtSignal(bool)
+    sig = qtc.pyqtSignal(int)
+
+    def connect(self, value):
+        self.sig.connect(value)
+
+    def emit(self, *args):
+        self.sig.emit(*args)
+
+
+class FloatChanged(qtc.QObject):
+    sig = qtc.pyqtSignal(float)
+
+    def connect(self, value):
+        self.sig.connect(value)
+
+    def emit(self, *args):
+        self.sig.emit(*args)
+
+
+class IntChanged(qtc.QObject):
+    sig = qtc.pyqtSignal(int)
+
+    def connect(self, value):
+        self.sig.connect(value)
+
+    def emit(self, *args):
+        self.sig.emit(*args)
+
+
+class StrChanged(qtc.QObject):
+    sig = qtc.pyqtSignal(str)
 
     def connect(self, value):
         self.sig.connect(value)

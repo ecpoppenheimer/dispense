@@ -11,40 +11,36 @@ from dispense.dispenser_tcp_controller import Dispenser
 class ClientWindow(qtw.QWidget):
     def __init__(self):
         super().__init__(windowTitle="Dispenser Controller")
-
-        # Set up the settings
-        self.settings_path = str(pathlib.Path(__file__).parent / "settings.dat")
-        self.settings = Settings()
-        try:
-            self.settings.load(self.settings_path)
-        except Exception:
-            pass
+        self.settings = Settings(str(pathlib.Path(__file__).parent / "settings.dat"))
+        self.dispenser = Dispenser(self.settings)
+        self.dispenser.polling_period = 1
 
         # Set up the UI
         layout = qtw.QVBoxLayout()
         self.setLayout(layout)
-        self.dispenser = Dispenser(self.settings)
-        layout.addWidget(self.dispenser.ui_widget)
 
-        """def a():
-            print("    * just went high")
+        self.test_button = qtw.QPushButton("Test")
+        self.test_button.clicked.connect(self.test)
+        layout.addWidget(self.test_button)
 
-        def b():
-            print("    * just went low")
-
-        def c():
-            print("    * just changed")
-
-        self.dispenser.registers["digitals"].running_high.connect(a)
-        self.dispenser.registers["digitals"].running_low.connect(b)
-        self.dispenser.registers["digitals"].running_changed.connect(c)"""
+        layout.addWidget(self.dispenser.make_connection_widget())
+        layout.addWidget(self.dispenser.make_polling_widget())
+        layout.addWidget(self.dispenser.make_trigger_widget())
+        layout.addWidget(self.dispenser.make_read_only_widget())
+        layout.addWidget(self.dispenser.make_date_time_widget())
+        layout.addWidget(self.dispenser.make_params_widget())
+        layout.addWidget(self.dispenser.make_digitals_widget())
+        layout.addStretch()
 
     def quit(self):
         self.dispenser.shut_down()
         try:
-            self.settings.save(self.settings_path)
+            self.settings.save()
         except Exception:
             pass
+
+    def test(self):
+        self.dispenser.trigger = not self.dispenser.trigger
 
 
 def make_app():
