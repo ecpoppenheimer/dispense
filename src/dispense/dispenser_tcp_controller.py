@@ -367,8 +367,8 @@ class Dispenser:
         self.disconnect(_error=True)
         # TODO crashes after reaching this point, without a traceback, only an exit code
 
-    def make_connection_widget(self):
-        return DispenserConnectionWidget(self)
+    def make_connection_widget(self, alignment="vertical"):
+        return DispenserConnectionWidget(self, alignment)
 
     def make_polling_widget(self):
         return DispenserPollingWidget(self)
@@ -1122,37 +1122,49 @@ class Dispenser:
 
 
 class DispenserConnectionWidget(qtw.QWidget):
-    def __init__(self, dispenser, *args, **kwargs):
+    def __init__(self, dispenser, alignment="vertical", *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.dispenser = dispenser
         self.dispenser.connection_event.connect(self._connection_changed)
-
-        layout = qtw.QGridLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.setLayout(layout)
-        ui_row = 0
 
         # IP controls
         self._ip_entry = sw.SettingsEntryBox(
             self.dispenser.settings, "dispenser_ip", str, validator=IP4Validator(), label="Dispenser IP"
         )
         self._ip_entry.edit_box.textChanged.connect(self._ip_changed)
-        layout.addWidget(self._ip_entry, ui_row, 0, 1, 12)
-        ui_row += 1
 
         self._port_entry = sw.SettingsEntryBox(
             self.dispenser.settings, "dispenser_port", int, validator=qtg.QIntValidator(0, 65535),
             label="Dispenser Port"
         )
-        layout.addWidget(self._port_entry, ui_row, 0, 1, 12)
-        ui_row += 1
 
         self._connect_button = qtw.QPushButton("Connect")
         self._connect_button.clicked.connect(self._click_connect)
-        layout.addWidget(self._connect_button, ui_row, 0, 1, 4)
 
         self._connection_indicator = Indicator("gray")
-        layout.addWidget(self._connection_indicator, ui_row, 5, 1, 1)
+
+        if alignment == "vertical":
+            layout = qtw.QGridLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.setLayout(layout)
+            ui_row = 0
+
+            layout.addWidget(self._ip_entry, ui_row, 0, 1, 12)
+            ui_row += 1
+            layout.addWidget(self._port_entry, ui_row, 0, 1, 12)
+            ui_row += 1
+            layout.addWidget(self._connect_button, ui_row, 0, 1, 4)
+            layout.addWidget(self._connection_indicator, ui_row, 5, 1, 1)
+        else:  # alignment == "horizontal"
+            layout = qtw.QHBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.setLayout(layout)
+
+            layout.addWidget(self._ip_entry)
+            layout.addWidget(self._port_entry)
+            layout.addWidget(self._connect_button)
+            layout.addWidget(self._connection_indicator)
+            layout.addStretch()
 
     def _connection_changed(self, state):
         if state == Dispenser.CONNECTED:
