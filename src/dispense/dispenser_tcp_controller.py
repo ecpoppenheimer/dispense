@@ -874,11 +874,10 @@ class Dispenser:
 
     def _format_pressure(self, val):
         low, high = self.get_pressure_lims()
-        return val * 100
-        """if low <= val <= high:
+        if low <= val <= high:
             return val * 100
         else:
-            raise ValueError(f"Dispenser: Pressure {val} out of range for unit: ({low}, {high}) {self.pressure_units}.")"""
+            raise ValueError(f"Dispenser: Pressure {val} out of range for unit: ({low}, {high}) {self.pressure_units}.")
 
     def get_pressure_lims(self, units=None):
         if units is None:
@@ -944,7 +943,7 @@ class Dispenser:
     def set_vacuum(self, val, callback, error_callback=None):
         self.write_registers[7] = self._format_vacuum(val)
         self._prepare_action(
-            self.WRITE, self.pulse("update_params", callback, error_callback), error_callback, (7, 1)
+            self.WRITE, lambda: self.pulse("update_params", callback, error_callback), error_callback, (7, 1)
         )
 
     @property
@@ -1032,7 +1031,7 @@ class Dispenser:
     def set_system_time(self, val, callback, error_callback=None):
         self.write_registers[11] = self._format_system_time(val)
         self._prepare_action(
-            self.WRITE, self.pulse("update_datetime", callback, error_callback), error_callback, (11, 1)
+            self.WRITE, lambda: self.pulse("update_datetime", callback, error_callback), error_callback, (11, 1)
         )
 
     @property
@@ -1077,7 +1076,7 @@ class Dispenser:
     def set_pressure_units(self, val, callback, error_callback=None):
         self.write_registers[4] = self._format_pressure_units(val)
         self._prepare_action(
-            self.WRITE, self.pulse("update_units", callback, error_callback), error_callback, (4, 1)
+            self.WRITE, lambda: self.pulse("update_units", callback, error_callback), error_callback, (4, 1)
         )
         self.read(5, 1)
 
@@ -1119,7 +1118,7 @@ class Dispenser:
     def set_vacuum_units(self, val, callback, error_callback=None):
         self.write_registers[6] = self._format_vacuum_units(val)
         self._prepare_action(
-            self.WRITE, self.pulse("update_units", callback, error_callback), error_callback, (6, 1)
+            self.WRITE, lambda: self.pulse("update_units", callback, error_callback), error_callback, (6, 1)
         )
 
     @property
