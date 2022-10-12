@@ -12,7 +12,7 @@ import epyqtsettings.settings_widgets as sw
 from epyqtsettings.settings import Settings
 from epyqtwidgets.indicator import Indicator
 
-STUPID_TIME_DELAY = .02
+STUPID_TIME_DELAY = .05
 
 
 class Dispenser:
@@ -341,8 +341,10 @@ class Dispenser:
         self._set_connection_state(self.CONNECTING)
 
     def disconnect(self, _error=False):
-        if self._server_socket is not None:
+        try:
             self._server_socket.close()
+        except Exception:
+            pass
         self._server_socket = None
         if _error:
             self._set_connection_state(self.CONNECTION_ERROR)
@@ -357,11 +359,11 @@ class Dispenser:
             self._server_socket.disconnected.connect(self.disconnect)
             self._server_socket.errorOccurred.connect(self._socket_error)
             self._server_socket.readyRead.connect(self._read_chunks)
-            self._set_connection_state(self.CONNECTED)
 
-            # Things to do when a new connection is initialized
+            # Things to do when a new connection is initialized.  Lets only set the connection state after we have done
+            # this initialization stuff.
             self.get_datetime()
-            self.read()
+            self.read(callback=lambda: self._set_connection_state(self.CONNECTED))
 
     def _socket_error(self, _error):
         self.disconnect(_error=True)
@@ -411,6 +413,7 @@ class Dispenser:
         return self._connection_state
 
     def _set_connection_state(self, state):
+        print(f"_set_connection_state just fired with state {state}")
         self._connection_state = state
         self.connection_event.emit(state)
 
@@ -436,6 +439,7 @@ class Dispenser:
         delimiter_pos = self._data_stream.find(b';')
         while delimiter_pos > 0:
             chunk = self._data_stream[:delimiter_pos]
+            print(f"[SERVER] {chunk}")
             chunk_data = np.asarray(chunk.split(b','))
             chunk_data =tuple(int(b.decode("utf-8")) for b in chunk_data)
             self._data_stream = self._data_stream[delimiter_pos + 1:]
@@ -487,11 +491,7 @@ class Dispenser:
 
                 # Read was sucessful!
                 if callback is not None:
-                    try:
-                        callback()
-                    except Exception as e:
-                        print(f"Dispenser: Error firing callback on read: {chunk_data}")
-                        print(e)
+                    callback()
             else:
                 print(f"Dispenser: Acknowledging read command but the registers do not match - out of order?")
                 return
@@ -501,11 +501,7 @@ class Dispenser:
                 f"{chunk_data}, args: {extra_args}"
             )
             if error_callback is not None:
-                try:
-                    error_callback()
-                except Exception as e:
-                    print(f"Dispenser: Error firing error callback on read: {chunk_data}")
-                    print(e)
+                error_callback()
 
     def _emit_digital_changes(self, new_value, old_value):
         new_dig = new_value
@@ -549,20 +545,13 @@ class Dispenser:
 
                 # Write was successful!
                 if callback is not None:
-                    try:
-                        callback()
-                    except Exception as e:
-                        print(f"Dispenser: Error firing callback on write: {chunk_data}")
-                        print(e)
+                    print(" - doing a callback!")
+                    callback()
                 return
 
         print(f"Dispenser: Error acknowledging write.  Chunk data: {chunk_data}, args: {extra_args}")
         if error_callback is not None:
-            try:
-                error_callback()
-            except Exception as e:
-                print(f"Dispenser: Error firing error_callback on write: {chunk_data}")
-                print(e)
+            error_callback()
 
     def _prepare_action(self, action, callback, error_callback, extra_args):
         """
@@ -600,14 +589,12 @@ class Dispenser:
         if action == self.READ or action == self.POLL:
             start_register, count = extra_args
             data = f"{self.READ},{start_register},{count};".encode("utf-8")
-            self._server_socket.write(data)
         elif action == self.WRITE:
             start_register, count = extra_args
             data = f"{self.WRITE},{start_register},{count}".encode("utf-8")
             for i in range(start_register, start_register + count):
                 data += f",{self.write_registers[i]}".encode("utf-8")
             data += b";"
-            self._server_socket.write(data)
         elif action == self.PULSE:
             mask, level = extra_args
             digitals = int(self.write_registers[0])
@@ -618,7 +605,8 @@ class Dispenser:
                 # pulsing off
                 digitals &= ~mask
             data = f"{self.WRITE},0,1,{digitals};".encode("utf-8")
-            self._server_socket.write(data)
+        print(f"[CLIENT] {data}")
+        self._server_socket.write(data)
 
     def read(self, start_register=0, count=None, callback=None, error_callback=None):
         """
@@ -813,8 +801,9 @@ class Dispenser:
 
     def set_program_num(self, val, callback, error_callback=None):
         self.write_registers[1] = self._format_program_num(val)
-        self._prepare_action(self.WRITE, None, error_callback, (1, 1))
-        self.pulse("update_program_num", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, lambda: self.pulse("update_program_num", callback, error_callback), error_callback, (1, 1)
+        )
 
     @property
     def dispense_mode(self):
@@ -855,8 +844,9 @@ class Dispenser:
 
     def set_dispense_mode(self, val, callback, error_callback=None):
         self.write_registers[2] = self._format_dispense_mode(val)
-        self._prepare_action(self.WRITE, None, error_callback, (2, 1))
-        self.pulse("update_params", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, lambda: self.pulse("update_params", callback, error_callback), error_callback, (2, 1)
+        )
 
     @property
     def dispense_time(self):
@@ -874,8 +864,9 @@ class Dispenser:
 
     def set_dispense_time(self, val, callback, error_callback=None):
         self.write_registers[3] = self._format_dispense_time(val)
-        self._prepare_action(self.WRITE, None, error_callback, (3, 1))
-        self.pulse("update_params", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, lambda: self.pulse("update_params", callback, error_callback), error_callback, (3, 1)
+        )
 
     @property
     def pressure(self):
@@ -883,10 +874,11 @@ class Dispenser:
 
     def _format_pressure(self, val):
         low, high = self.get_pressure_lims()
-        if low <= val <= high:
+        return val * 100
+        """if low <= val <= high:
             return val * 100
         else:
-            raise ValueError(f"Dispenser: Pressure {val} out of range for unit: ({low}, {high}) {self.pressure_units}.")
+            raise ValueError(f"Dispenser: Pressure {val} out of range for unit: ({low}, {high}) {self.pressure_units}.")"""
 
     def get_pressure_lims(self, units=None):
         if units is None:
@@ -898,6 +890,8 @@ class Dispenser:
                 return .02, 1.03
             elif units == "kPa":
                 return 2.1, 103.4
+            else:
+                raise ValueError("Dispenser TCP Controller - get_pressure_lims: pressure units are invalid.")
         else:  # self.model_type == "UltimusPlus-NX I":
             if units == "psi":
                 return 10.0, 100.0
@@ -905,6 +899,8 @@ class Dispenser:
                 return .68, 6.89
             elif units == "kPa":
                 return 68.9, 689.4
+            else:
+                raise ValueError("Dispenser TCP Controller - get_pressure_lims: pressure units are invalid.")
 
     @pressure.setter
     def pressure(self, val):
@@ -914,8 +910,9 @@ class Dispenser:
 
     def set_pressure(self, val, callback, error_callback=None):
         self.write_registers[5] = self._format_pressure(val)
-        self._prepare_action(self.WRITE, None, error_callback, (5, 1))
-        self.pulse("update_params", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, lambda: self.pulse("update_params", callback, error_callback), error_callback, (5, 1)
+        )
 
     @property
     def vacuum(self):
@@ -946,8 +943,9 @@ class Dispenser:
 
     def set_vacuum(self, val, callback, error_callback=None):
         self.write_registers[7] = self._format_vacuum(val)
-        self._prepare_action(self.WRITE, None, error_callback, (7, 1))
-        self.pulse("update_params", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, self.pulse("update_params", callback, error_callback), error_callback, (7, 1)
+        )
 
     @property
     def system_count(self):
@@ -973,8 +971,9 @@ class Dispenser:
 
     def set_multishot_count(self, val, callback, error_callback=None):
         self.write_registers[8] = self._format_multishot_count(val)
-        self._prepare_action(self.WRITE, None, error_callback, (8, 1))
-        self.pulse("update_params", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, lambda: self.pulse("update_params", callback, error_callback), error_callback, (8, 1)
+        )
 
     @property
     def multishot_time(self):
@@ -992,8 +991,9 @@ class Dispenser:
 
     def set_multishot_time(self, val, callback, error_callback=None):
         self.write_registers[9] = self._format_multishot_time(val)
-        self._prepare_action(self.WRITE, None, error_callback, (9, 1))
-        self.pulse("update_params", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, lambda: self.pulse("update_params", callback, error_callback), error_callback, (9, 1)
+        )
 
     @property
     def system_date(self):
@@ -1011,8 +1011,9 @@ class Dispenser:
 
     def set_system_date(self, val, callback, error_callback=None):
         self.write_registers[10] = self._format_system_date(val)
-        self._prepare_action(self.WRITE, None, error_callback, (10, 1))
-        self.pulse("update_datetime", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, lambda: self.pulse("update_datetime", callback, error_callback), error_callback, (10, 1)
+        )
 
     @property
     def system_time(self):
@@ -1030,8 +1031,9 @@ class Dispenser:
 
     def set_system_time(self, val, callback, error_callback=None):
         self.write_registers[11] = self._format_system_time(val)
-        self._prepare_action(self.WRITE, None, error_callback, (11, 1))
-        self.pulse("update_datetime", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, self.pulse("update_datetime", callback, error_callback), error_callback, (11, 1)
+        )
 
     @property
     def software_version(self):
@@ -1074,8 +1076,9 @@ class Dispenser:
 
     def set_pressure_units(self, val, callback, error_callback=None):
         self.write_registers[4] = self._format_pressure_units(val)
-        self._prepare_action(self.WRITE, None, error_callback, (4, 1))
-        self.pulse("update_units", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, self.pulse("update_units", callback, error_callback), error_callback, (4, 1)
+        )
         self.read(5, 1)
 
     @property
@@ -1115,8 +1118,9 @@ class Dispenser:
 
     def set_vacuum_units(self, val, callback, error_callback=None):
         self.write_registers[6] = self._format_vacuum_units(val)
-        self._prepare_action(self.WRITE, None, error_callback, (6, 1))
-        self.pulse("update_units", callback, error_callback)
+        self._prepare_action(
+            self.WRITE, self.pulse("update_units", callback, error_callback), error_callback, (6, 1)
+        )
 
     @property
     def time_format(self):
@@ -1697,7 +1701,10 @@ class ConnectionChanged(qtc.QObject):
         self.sig.connect(value)
 
     def emit(self, *args):
-        self.sig.emit(*args)
+        try:
+            self.sig.emit(*args)
+        except RuntimeError:
+            pass
 
 
 class FloatChanged(qtc.QObject):
