@@ -520,6 +520,7 @@ class Dispenser:
             self.log_full_changed.emit(new_dig & 0x8)
 
     def _acknowledge_write(self, chunk_data, is_pulse):
+        print(f"acknowledge write: {self._pending_action}")
         command, callback, error_callback, extra_args = self._pending_action
         if chunk_data[0] == self.WRITE:
             if is_pulse:
@@ -658,7 +659,7 @@ class Dispenser:
         self._prepare_action(self.WRITE, callback, error_callback, (start_register, count))
 
     def pulse(self, register, callback=None, error_callback=None):
-        self._prepare_action(self.PULSE, callback, error_callback, (self.DIGITAL_WRITE_REGISTERS[register], True))
+        self._prepare_action(self.PULSE, None, error_callback, (self.DIGITAL_WRITE_REGISTERS[register], True))
         self._prepare_action(self.PULSE, callback, error_callback, (self.DIGITAL_WRITE_REGISTERS[register], False))
 
     def get_datetime(self):
