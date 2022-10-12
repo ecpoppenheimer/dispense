@@ -365,6 +365,7 @@ class Dispenser:
 
     def _socket_error(self, _error):
         self.disconnect(_error=True)
+        print(f"received socket error: {_error}")
         # TODO crashes after reaching this point, without a traceback, only an exit code
 
     def make_connection_widget(self, alignment="vertical"):
@@ -435,7 +436,6 @@ class Dispenser:
         delimiter_pos = self._data_stream.find(b';')
         while delimiter_pos > 0:
             chunk = self._data_stream[:delimiter_pos]
-            print(f"[SERVER] {str(chunk)}")
             chunk_data = np.asarray(chunk.split(b','))
             chunk_data =tuple(int(b.decode("utf-8")) for b in chunk_data)
             self._data_stream = self._data_stream[delimiter_pos + 1:]
@@ -487,7 +487,11 @@ class Dispenser:
 
                 # Read was sucessful!
                 if callback is not None:
-                    callback(chunk_data)
+                    try:
+                        callback()
+                    except Exception as e:
+                        print(f"Dispenser: Error firing callback on read: {chunk_data}")
+                        print(e)
             else:
                 print(f"Dispenser: Acknowledging read command but the registers do not match - out of order?")
                 return
@@ -497,7 +501,11 @@ class Dispenser:
                 f"{chunk_data}, args: {extra_args}"
             )
             if error_callback is not None:
-                error_callback(chunk_data)
+                try:
+                    error_callback()
+                except Exception as e:
+                    print(f"Dispenser: Error firing error callback on read: {chunk_data}")
+                    print(e)
 
     def _emit_digital_changes(self, new_value, old_value):
         new_dig = new_value
@@ -541,12 +549,20 @@ class Dispenser:
 
                 # Write was successful!
                 if callback is not None:
-                    callback(chunk_data)
+                    try:
+                        callback()
+                    except Exception as e:
+                        print(f"Dispenser: Error firing callback on write: {chunk_data}")
+                        print(e)
                 return
 
         print(f"Dispenser: Error acknowledging write.  Chunk data: {chunk_data}, args: {extra_args}")
         if error_callback is not None:
-            error_callback(chunk_data)
+            try:
+                error_callback()
+            except Exception as e:
+                print(f"Dispenser: Error firing error_callback on write: {chunk_data}")
+                print(e)
 
     def _prepare_action(self, action, callback, error_callback, extra_args):
         """
@@ -584,7 +600,6 @@ class Dispenser:
         if action == self.READ or action == self.POLL:
             start_register, count = extra_args
             data = f"{self.READ},{start_register},{count};".encode("utf-8")
-            print(f"[CLIENT] {data}")
             self._server_socket.write(data)
         elif action == self.WRITE:
             start_register, count = extra_args
@@ -592,7 +607,6 @@ class Dispenser:
             for i in range(start_register, start_register + count):
                 data += f",{self.write_registers[i]}".encode("utf-8")
             data += b";"
-            print(f"[CLIENT] {data}")
             self._server_socket.write(data)
         elif action == self.PULSE:
             mask, level = extra_args
@@ -604,7 +618,6 @@ class Dispenser:
                 # pulsing off
                 digitals &= ~mask
             data = f"{self.WRITE},0,1,{digitals};".encode("utf-8")
-            print(f"[CLIENT] {data}")
             self._server_socket.write(data)
 
     def read(self, start_register=0, count=None, callback=None, error_callback=None):
