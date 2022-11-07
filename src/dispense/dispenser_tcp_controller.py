@@ -413,7 +413,6 @@ class Dispenser:
         return self._connection_state
 
     def _set_connection_state(self, state):
-        print(f"_set_connection_state just fired with state {state}")
         self._connection_state = state
         self.connection_event.emit(state)
 
