@@ -438,7 +438,6 @@ class Dispenser:
         delimiter_pos = self._data_stream.find(b';')
         while delimiter_pos > 0:
             chunk = self._data_stream[:delimiter_pos]
-            print(f"[SERVER] {chunk}")
             chunk_data = np.asarray(chunk.split(b','))
             chunk_data =tuple(int(b.decode("utf-8")) for b in chunk_data)
             self._data_stream = self._data_stream[delimiter_pos + 1:]
@@ -544,7 +543,6 @@ class Dispenser:
 
                 # Write was successful!
                 if callback is not None:
-                    print(" - doing a callback!")
                     callback()
                 return
 
@@ -604,7 +602,6 @@ class Dispenser:
                 # pulsing off
                 digitals &= ~mask
             data = f"{self.WRITE},0,1,{digitals};".encode("utf-8")
-        print(f"[CLIENT] {data}")
         self._server_socket.write(data)
 
     def read(self, start_register=0, count=None, callback=None, error_callback=None):
